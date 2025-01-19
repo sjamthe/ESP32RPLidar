@@ -1,0 +1,119 @@
+/*
+ * Expect output for getInfo
+model: 24
+firmware: 1.24
+hardware: 5
+serialNumber (HEX): 81 53 9D F1 C3 E3 9A C4 C3 E6 98 F9 71 84 34 0D 
+ *
+ */
+#include "RPLidar.h"
+
+RPLidar lidar(Serial2, 16, 17, 25); 
+
+void setup() {
+    // Start USB serial for debugging and wait for port to be ready
+    Serial.begin(115200);
+    delay(2000);  // Give time for USB serial to properly initialize
+    Serial.println("\n\nRPLidar Test Starting...");
+    delay(500);   // Additional delay to ensure stability
+    
+    // Initialize RPLidar
+    Serial.println("Initializing RPLidar...");
+    if (!lidar.begin()) {
+        Serial.println("Failed to start RPLidar");
+        return;
+    }
+    
+    // Get device info
+    RPLidar::DeviceInfo info;
+    if (lidar.getInfo(info)) {
+        Serial.println("RPLidar Info:");
+        Serial.printf("  Model: %02d ", info.model);
+        switch(info.model) {
+            case 0x18: Serial.println("(RPLIDAR A-series)"); break;
+            default: Serial.println("(Unknown model)"); break;
+        }
+        // Swap minor and major for correct display
+        Serial.printf("  Firmware Version: %d.%02d\n", info.firmware_major, info.firmware_minor);
+        Serial.printf("  Hardware Version: 0x%02d\n", info.hardware);
+        Serial.print("  Serial Number: ");
+        for (int i = 0; i < 16; i++) {
+            Serial.printf("%02X", info.serialnum[i]);
+        }
+        Serial.println();
+    }
+
+    // Get health status
+    RPLidar::DeviceHealth health;
+    if (lidar.getHealth(health)) {
+        Serial.println("RPLidar Health:");
+        Serial.printf("  Status: %d\n", health.status);
+        Serial.printf("  Error Code: 0x%04X\n", health.error_code);
+        if (health.status == 2) {  // Error state
+            Serial.println("Device is in error state!");
+            delay(1000);  // Give time for error message to be sent
+            ESP.restart(); // Restart on error
+            return;
+        }
+    } else {
+        Serial.println("Failed to get device health");
+        delay(1000);  // Give time for error message to be sent
+        ESP.restart(); // Restart if we can't get health info
+    }
+
+    // Reset device before starting
+    Serial.println("Resetting RPLidar...");
+    lidar.reset();
+    delay(2000);  // Give it time to reset
+    
+    // Start motor with a clean delay sequence
+    Serial.println("Starting motor...");
+    lidar.startMotor();
+    delay(1000);  // Give motor time to reach speed
+
+    // Start scan
+    Serial.println("Starting scan...");
+    if (!lidar.startScan()) {
+        Serial.println("Failed to start scan");
+        delay(1000);  // Give time for error message to be sent
+        ESP.restart(); // Restart on scan failure
+        return;
+    }
+    Serial.println("Scan started successfully");
+
+    // Wait for measurements to start
+    delay(1000);
+}
+
+unsigned long lastPrint = 0;
+unsigned long measurementCount = 0;
+bool firstMeasurement = true;
+
+void loop() {
+    RPLidar::MeasurementData measurement;
+    
+    if (lidar.readMeasurement(measurement)) {
+        if (firstMeasurement) {
+            Serial.println("First measurement received!");
+            firstMeasurement = false;
+        }
+        
+        if (measurement.quality >= RPLidar::MIN_QUALITY) {
+            measurementCount++;
+            
+            // Print stats every second
+            if (millis() - lastPrint >= 1000) {
+                Serial.printf("Measurements per second: %lu\n", measurementCount);
+                Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+                             measurement.angle, measurement.distance, measurement.quality);
+                measurementCount = 0;
+                lastPrint = millis();
+            }
+        }
+    } else {
+        if (millis() - lastPrint >= 1000) {
+            Serial.println("No measurements received in last second");
+            lastPrint = millis();
+        }
+    }
+}
