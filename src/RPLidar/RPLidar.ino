@@ -52,13 +52,21 @@ void setup() {
         if (health.status == 2) {  // Error state
             Serial.println("Device is in error state!");
             delay(1000);  // Give time for error message to be sent
-            ESP.restart(); // Restart on error
+            //ESP.restart(); // Restart on error
             return;
         }
     } else {
-        Serial.println("Failed to get device health");
-        delay(1000);  // Give time for error message to be sent
-        ESP.restart(); // Restart if we can't get health info
+        Serial.println("Error: Failed to get device health");
+    }
+
+    //Get Scan Rate
+    RPLidar::DeviceScanRate scanRate;
+    if (lidar.getSampleRate(scanRate)) {
+        Serial.println("RPLidar Scan Rate:");
+        Serial.printf("  Standard Scan Rate: %d usecs\n", scanRate.standard);
+        Serial.printf("  Express Scan Rate: %d usecs\n", scanRate.express);
+    } else {
+        Serial.println("Error: Failed to get scan rate");
     }
 
     // Reset device before starting
@@ -73,21 +81,26 @@ void setup() {
 
     // Start scan
     Serial.println("Starting scan...");
-    if (!lidar.startScan()) {
+    if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
         delay(1000);  // Give time for error message to be sent
-        ESP.restart(); // Restart on scan failure
+        //ESP.restart(); // Restart on scan failure (Should we restart lidar instead of ESP?)
         return;
     }
     Serial.println("Scan started successfully");
 
     // Wait for measurements to start
-    delay(1000);
+    delay(200);
 }
 
-unsigned long lastPrint = 0;
+unsigned long startMillis = 0;
 unsigned long measurementCount = 0;
+unsigned long rpsCount = 0;
 bool firstMeasurement = true;
+
+void loop1() {
+
+}
 
 void loop() {
     RPLidar::MeasurementData measurement;
@@ -95,6 +108,7 @@ void loop() {
     if (lidar.readMeasurement(measurement)) {
         if (firstMeasurement) {
             Serial.println("First measurement received!");
+            startMillis = millis();
             firstMeasurement = false;
         }
         
@@ -102,18 +116,19 @@ void loop() {
             measurementCount++;
             
             // Print stats every second
-            if (millis() - lastPrint >= 1000) {
-                Serial.printf("Measurements per second: %lu\n", measurementCount);
+            if ((millis() - startMillis) > 1000) {
+                Serial.printf("Measurements per second: %lu, time(ms) %lu\n", measurementCount, (millis()-startMillis));
                 Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
                              measurement.angle, measurement.distance, measurement.quality);
+                startMillis = millis();
                 measurementCount = 0;
-                lastPrint = millis();
             }
         }
-    } else {
+    } 
+    /*else {
         if (millis() - lastPrint >= 1000) {
             Serial.println("No measurements received in last second");
             lastPrint = millis();
         }
-    }
+    }*/
 }

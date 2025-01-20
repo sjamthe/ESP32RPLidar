@@ -1,3 +1,4 @@
+#include <sys/_stdint.h>
 // RPLidar.cpp
 #include "RPLidar.h"
 
@@ -33,13 +34,13 @@ void RPLidar::end() {
 
 bool RPLidar::stop() {
     sendCommand(CMD_STOP);
-    delay(1); // Per protocol spec
+    delay(1); // Per protocol spec, give 1ms gap before other command.
     return true;
 }
 
 bool RPLidar::reset() {
-    sendCommand(CMD_RESET);
-    delay(2); // Per protocol spec
+    sendCommand(CMD_RESET); // reboot lidar microcontroller
+    delay(2); // Per protocol spec, give 2ms gap before other command.
     return true;
 }
 
@@ -50,7 +51,7 @@ bool RPLidar::startScan() {
     
     // Send scan command
     sendCommand(CMD_SCAN);
-    
+
     // Wait for response header
     if (!waitResponseHeader()) {
         return false;
@@ -59,7 +60,8 @@ bool RPLidar::startScan() {
     if (!verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_SCAN, 5)) {
         return false;
     }
-    
+    _serial.setTimeout(FAST_READ_TIMEOUT_MS); // Ready to read measurements
+
     return true;
 }
 
@@ -76,8 +78,19 @@ bool RPLidar::startExpressScan() {
     if (!waitResponseHeader()) {
         return false;
     }
+	// Verify response descriptor
+	if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_LEGACY_SCAN, 84)) {
+		Serial.println("Response is of type RESP_TYPE_EXPRESS_LEGACY_SCAN");
+        return true;
+    }
+    else if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_EXTENDED_SCAN, 132)) {
+		Serial.println("Response is of type RESP_TYPE_EXPRESS_EXTENDED_SCAN");
+        return true;
+    } else if(verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_DENSE_SCAN, 84)) {
+		Serial.println("Response is of type RESP_TYPE_EXPRESS_DENSE_SCAN");
+	}
     
-    return true;
+    return false;
 }
 
 bool RPLidar::forceScan() {
@@ -117,6 +130,37 @@ bool RPLidar::getHealth(DeviceHealth& health) {
     
     health.status = buffer[0];
     health.error_code = (buffer[1] | (buffer[2] << 8));
+    
+    return true;
+}
+
+bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
+    //Serial.println("Requesting scan rate...");
+    flushInput();
+    
+    sendCommand(GET_SAMPLERATE);
+    //Serial.println("SampleRate command sent, waiting for response...");
+    
+    if (!waitResponseHeader()) {
+        Serial.println("Failed to get health response header");
+        return false;
+    }
+	uint32_t expectedLength = 4; 
+    // Verify response descriptor
+    if (!verifyResponseDescriptor(SINGLE_RESP_MODE, RESP_TYPE_SCAN_RATE, expectedLength)) {
+        return false;
+    }
+    
+    // Read data according to length from descriptor
+    uint8_t buffer[expectedLength];
+    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    if (bytesRead != _responseDescriptor.length) {
+        Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
+        return false;
+    }
+    
+    scanRate.standard = (buffer[0] | (buffer[1] << 8));
+	scanRate.express = (buffer[2] | (buffer[3] << 8));
     
     return true;
 }
@@ -163,24 +207,41 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     return true;
 }
 
-bool RPLidar::readMeasurement(MeasurementData& measurement) {
-    uint8_t buffer[5];
+/*bool RPLidar::readMeasurement2(MeasurementData& measurement) {
     
     // Read measurement data
     if (_serial.readBytes(buffer, sizeof(buffer)) != sizeof(buffer)) {
+		Serial.println("Measurement Timeout Error");
         return false;
     }
     
     // Parse measurement data
-    measurement.startFlag = (buffer[0] & 0x1) == 0x1;
+    measurement.startFlag = (buffer[0] & 0x1) == 0x1; // set start flag is least significant bit is 1
+    // Extract the two bits and compare them
+    bool areNotEqual = ((buffer[0] & 0x2) >> 1) != (buffer[0] & 0x1);
+    if(!areNotEqual) {
+		Serial.println("Measurement Data Error: 1st & second bit are not inverse");
+		for (int i = 7; i >= 0; i--) {
+        	Serial.printf("%d", (buffer[0] >> i) & 1);
+    	}
+		Serial.println();
+		return false;
+    }
+	// Extract quality of reflected laser light.
     measurement.quality = buffer[0] >> 2;
     
-    if (measurement.quality == 0) {
-        return false;
-    }
-    
+	// Extract check bit.
+	if ((buffer[1] & 0x1) != 0x1) {
+		Serial.println("Measurement Data Error: Checkbit is not 1");
+		for (int i = 7; i >= 0; i--) {
+        	Serial.printf("%d", (buffer[1] >> i) & 1);
+    	}
+		Serial.println();
+		return false;
+	}
+
     // Calculate angle (Q6 format)
-    uint16_t angle_q6 = ((buffer[2] << 7) | (buffer[1] >> 1)) >> 0;
+    uint16_t angle_q6 = ((buffer[2] << 7) | (buffer[1] >> 1));
     measurement.angle = static_cast<float>(angle_q6) / 64.0f;
     
     // Calculate distance (Q2 format)
@@ -188,6 +249,57 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
     measurement.distance = static_cast<float>(distance_q2) / 4.0f;
     
     return true;
+}*/
+
+bool RPLidar::readMeasurement(MeasurementData& measurement) {
+    uint32_t currentTs = millis();
+    uint32_t remainingtime;
+    rplidar_response_measurement_node_t node;
+   uint8_t *nodebuf = (uint8_t*)&node;
+
+	uint8_t recvPos = 0;
+
+	while ((remainingtime=millis() - currentTs) <= FAST_READ_TIMEOUT_MS) {
+		int currentbyte = _serial.read();
+		if (currentbyte<0) continue;
+
+		switch (recvPos) {
+			case 0: // expect the sync bit and its reverse in this byte          {
+				{
+					uint8_t tmp = (currentbyte>>1);
+					if ( (tmp ^ currentbyte) & 0x1 ) {
+						// pass
+					} else {
+						continue;
+					}
+
+				}
+				break;
+			case 1: // expect the highest bit to be 1
+				{
+					if (currentbyte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
+						// pass
+					} else {
+						recvPos = 0;
+						continue;
+					}
+				}
+				break;
+		}
+		nodebuf[recvPos++] = currentbyte;
+
+		if (recvPos == sizeof(measurement)) {
+			// store the data ...
+			measurement.distance = node.distance_q2/4.0f;
+			measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
+			measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+			measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+			return true;
+		}
+			
+	}
+
+	return false;
 }
 
 void RPLidar::startMotor(uint8_t pwm) {
