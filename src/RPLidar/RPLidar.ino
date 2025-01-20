@@ -114,14 +114,20 @@ void loop() {
         
         if (measurement.quality >= RPLidar::MIN_QUALITY) {
             measurementCount++;
+
+            if(measurement.startFlag) {
+              rpsCount++;
+            }
             
             // Print stats every second
-            if ((millis() - startMillis) > 1000) {
-                Serial.printf("Measurements per second: %lu, time(ms) %lu\n", measurementCount, (millis()-startMillis));
-                Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
-                             measurement.angle, measurement.distance, measurement.quality);
+            unsigned long now = millis();
+            if ((now - startMillis) > 5000) {
+                Serial.printf("Measurements per second: %04.0f, rps %04.0f\n", measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
+                //Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+                //             measurement.angle, measurement.distance, measurement.quality);
                 startMillis = millis();
                 measurementCount = 0;
+                rpsCount = 0;
             }
         }
     } 

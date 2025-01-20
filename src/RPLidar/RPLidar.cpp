@@ -1,3 +1,5 @@
+#include <cstddef>
+#include "Arduino.h"
 #include <sys/_stdint.h>
 // RPLidar.cpp
 #include "RPLidar.h"
@@ -60,7 +62,6 @@ bool RPLidar::startScan() {
     if (!verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_SCAN, 5)) {
         return false;
     }
-    _serial.setTimeout(FAST_READ_TIMEOUT_MS); // Ready to read measurements
 
     return true;
 }
@@ -206,60 +207,74 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     
     return true;
 }
-
-/*bool RPLidar::readMeasurement2(MeasurementData& measurement) {
-    
-    // Read measurement data
-    if (_serial.readBytes(buffer, sizeof(buffer)) != sizeof(buffer)) {
-		Serial.println("Measurement Timeout Error");
-        return false;
-    }
-    
-    // Parse measurement data
-    measurement.startFlag = (buffer[0] & 0x1) == 0x1; // set start flag is least significant bit is 1
-    // Extract the two bits and compare them
-    bool areNotEqual = ((buffer[0] & 0x2) >> 1) != (buffer[0] & 0x1);
-    if(!areNotEqual) {
-		Serial.println("Measurement Data Error: 1st & second bit are not inverse");
-		for (int i = 7; i >= 0; i--) {
-        	Serial.printf("%d", (buffer[0] >> i) & 1);
-    	}
-		Serial.println();
-		return false;
-    }
-	// Extract quality of reflected laser light.
-    measurement.quality = buffer[0] >> 2;
-    
-	// Extract check bit.
-	if ((buffer[1] & 0x1) != 0x1) {
-		Serial.println("Measurement Data Error: Checkbit is not 1");
-		for (int i = 7; i >= 0; i--) {
-        	Serial.printf("%d", (buffer[1] >> i) & 1);
-    	}
-		Serial.println();
-		return false;
-	}
-
-    // Calculate angle (Q6 format)
-    uint16_t angle_q6 = ((buffer[2] << 7) | (buffer[1] >> 1));
-    measurement.angle = static_cast<float>(angle_q6) / 64.0f;
-    
-    // Calculate distance (Q2 format)
-    uint16_t distance_q2 = (buffer[4] << 8) | buffer[3];
-    measurement.distance = static_cast<float>(distance_q2) / 4.0f;
-    
-    return true;
-}*/
-
+/*
 bool RPLidar::readMeasurement(MeasurementData& measurement) {
     uint32_t currentTs = millis();
     uint32_t remainingtime;
     rplidar_response_measurement_node_t node;
-   uint8_t *nodebuf = (uint8_t*)&node;
+    uint8_t *nodebuf = (uint8_t*)&node;
+
+	uint8_t recvPos = 0;
+	uint8_t buffer[sizeof(rplidar_response_measurement_node_t)];
+	if(_serial.available() < sizeof(buffer)) {
+		return false;
+	}
+	size_t bytesRead = _serial.readBytes(buffer, sizeof(buffer));
+
+	for (int i=0; i<sizeof(buffer); i++) {
+		int currentbyte =buffer[i];
+		if (currentbyte<0) continue;
+
+		switch (recvPos) {
+			case 0: // expect the sync bit and its reverse in this byte          {
+				{
+					uint8_t tmp = (currentbyte>>1);
+					if ( (tmp ^ currentbyte) & 0x1 ) {
+						// pass
+					} else {
+						Serial.printf("Failed case 0 for i = %d\n", i);
+						continue;
+					}
+
+				}
+				break;
+			case 1: // expect the highest bit to be 1
+				{
+					if (currentbyte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
+						// pass
+					} else {
+						recvPos = 0;
+						Serial.printf("Failed case 1 for i = %d\n", i);
+						continue;
+					}
+				}
+				break;
+		}
+		nodebuf[recvPos++] = currentbyte;
+
+		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+			// store the data ...
+			measurement.distance = node.distance_q2/4.0f;
+			measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
+			measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+			measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+			return true;
+		} else {
+			Serial.printf("recvPos is short = %d\n", recvPos);
+		}
+			
+	}
+
+	return false;
+}*/
+
+bool RPLidar::readMeasurement(MeasurementData& measurement) {
+    rplidar_response_measurement_node_t node;
+    uint8_t *nodebuf = (uint8_t*)&node;
 
 	uint8_t recvPos = 0;
 
-	while ((remainingtime=millis() - currentTs) <= FAST_READ_TIMEOUT_MS) {
+	while(1) {
 		int currentbyte = _serial.read();
 		if (currentbyte<0) continue;
 
@@ -288,7 +303,7 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
 		}
 		nodebuf[recvPos++] = currentbyte;
 
-		if (recvPos == sizeof(measurement)) {
+		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
 			// store the data ...
 			measurement.distance = node.distance_q2/4.0f;
 			measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;

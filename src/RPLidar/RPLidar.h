@@ -1,3 +1,4 @@
+#include <stdint.h>
 // RPLidar.h
 #ifndef RPLIDAR_H
 #define RPLIDAR_H
@@ -119,6 +120,9 @@ private:
     int _motorPin;
     bool _motorEnabled;
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
+    uint8_t _buffer[5]; // 2x of 5
+    uint8_t _unreadBytes = 0; // how many bytes in the buffer are not processed yet
+    uint8_t _startByte = 0; // where in the buffer should we start processing.
 
     // Helper functions
     bool waitResponseHeader();
