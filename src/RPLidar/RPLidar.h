@@ -6,6 +6,9 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 
+const uint8_t STANDARD_DATA_ROT_START_BITS = 0b00000011; //the lowest 2 bits of the first byte is the rotation_start flag(s)
+const uint8_t STANDARD_DATA_CHECK_BIT = 0b00000001; //the LSBit of the second byte is a check but, should always be 1
+
 #define RPLIDAR_RESP_MEASUREMENT_SYNCBIT        (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT  2
 #define RPLIDAR_RESP_MEASUREMENT_CHECKBIT       (0x1<<0)
@@ -58,6 +61,7 @@ public:
         float distance;     // In millimeters
         uint8_t quality;    // Quality of measurement
         bool startFlag;     // Start flag for new scan
+        unsigned long errorCount;
     };
 
     // Structure for device info

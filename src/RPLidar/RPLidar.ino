@@ -81,7 +81,7 @@ void setup() {
 
     // Start scan
     Serial.println("Starting scan...");
-    if (!lidar.startExpressScan()) {
+    if (!lidar.startScan()) {
         Serial.println("Failed to start scan");
         delay(1000);  // Give time for error message to be sent
         //ESP.restart(); // Restart on scan failure (Should we restart lidar instead of ESP?)
@@ -96,6 +96,7 @@ void setup() {
 unsigned long startMillis = 0;
 unsigned long measurementCount = 0;
 unsigned long rpsCount = 0;
+unsigned long errorCount = 0;
 bool firstMeasurement = true;
 
 void loop1() {
@@ -112,8 +113,12 @@ void loop() {
             firstMeasurement = false;
         }
         
-        if (measurement.quality >= RPLidar::MIN_QUALITY) {
-            measurementCount++;
+        //if (measurement.quality >= RPLidar::MIN_QUALITY) {
+            //measurementCount++;
+            if(measurement.errorCount)
+              errorCount++;
+            else
+             measurementCount++;
 
             if(measurement.startFlag) {
               rpsCount++;
@@ -121,15 +126,17 @@ void loop() {
             
             // Print stats every second
             unsigned long now = millis();
-            if ((now - startMillis) > 5000) {
-                Serial.printf("Measurements per second: %04.0f, rps %04.0f\n", measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
+            if ((now - startMillis) > 10000) {
+                Serial.printf("Errors: %u, Measurements %u, Measurements per second: %04.0f, rps %04.0f\n",
+                 errorCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
                 //Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
                 //             measurement.angle, measurement.distance, measurement.quality);
                 startMillis = millis();
                 measurementCount = 0;
                 rpsCount = 0;
+                errorCount = 0;
             }
-        }
+        //}
     } 
     /*else {
         if (millis() - lastPrint >= 1000) {

@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstddef>
 #include "Arduino.h"
 #include <sys/_stdint.h>
@@ -207,67 +208,83 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     
     return true;
 }
-/*
+// If we do no processing we can achieve 2100 readings
 bool RPLidar::readMeasurement(MeasurementData& measurement) {
-    uint32_t currentTs = millis();
-    uint32_t remainingtime;
-    rplidar_response_measurement_node_t node;
-    uint8_t *nodebuf = (uint8_t*)&node;
+	int counter = 0;
+	rplidar_response_measurement_node_t node;
+	uint8_t *nodeBuffer = (uint8_t*)&node;
+	uint8_t recvBuffer[5];
 
+	measurement.errorCount = 0;
 	uint8_t recvPos = 0;
-	uint8_t buffer[sizeof(rplidar_response_measurement_node_t)];
-	if(_serial.available() < sizeof(buffer)) {
-		return false;
-	}
-	size_t bytesRead = _serial.readBytes(buffer, sizeof(buffer));
+	_serial.setRxTimeout(0);
+	while(1) {
+		//int currentbyte = _serial.read();
+		//if (currentbyte<0) continue;
+		if(_serial.available() <5)
+			continue;
+		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
+		if(bytesRead < 5) {
+			Serial.println("Error: read less than available should not happen");
+			continue;
+		}
 
-	for (int i=0; i<sizeof(buffer); i++) {
-		int currentbyte =buffer[i];
-		if (currentbyte<0) continue;
-
-		switch (recvPos) {
-			case 0: // expect the sync bit and its reverse in this byte          {
+		//validation - NOTE: THIS CHECKBIT being false brings rate from 2100 to 1000
+		for (size_t pos = 0; pos < bytesRead; ++pos) {
+			uint8_t currentByte = recvBuffer[pos];
+			switch (recvPos) {
+				case 0: // expect the sync bit and its reverse in this byte
 				{
-					uint8_t tmp = (currentbyte>>1);
-					if ( (tmp ^ currentbyte) & 0x1 ) {
+					uint8_t tmp = (currentByte >> 1);
+					if ((tmp ^ currentByte) & 0x1) {
 						// pass
-					} else {
-						Serial.printf("Failed case 0 for i = %d\n", i);
+					}
+					else {
+						measurement.errorCount++;
 						continue;
 					}
 
 				}
-				break;
-			case 1: // expect the highest bit to be 1
+					break;
+				case 1: // expect the highest bit to be 1
 				{
-					if (currentbyte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
+					if (currentByte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
 						// pass
-					} else {
+					}
+					else {
 						recvPos = 0;
-						Serial.printf("Failed case 1 for i = %d\n", i);
+						measurement.errorCount++;
 						continue;
 					}
 				}
+					break;
+			}
+			if(measurement.errorCount)
 				break;
-		}
-		nodebuf[recvPos++] = currentbyte;
+			nodeBuffer[recvPos++] = currentByte;
 
-		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
-			// store the data ...
-			measurement.distance = node.distance_q2/4.0f;
-			measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
-			measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
-			measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
-			return true;
-		} else {
-			Serial.printf("recvPos is short = %d\n", recvPos);
+			if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+				break;
+			}
 		}
-			
+		if(measurement.errorCount)
+				break;
+		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+			break;
+		}
 	}
 
-	return false;
-}*/
-
+	// store the data ...
+	if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+		measurement.distance = node.distance_q2/4.0f;
+		measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
+		measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+		measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+		return true;
+	}
+	return true;
+}
+/*
 bool RPLidar::readMeasurement(MeasurementData& measurement) {
     rplidar_response_measurement_node_t node;
     uint8_t *nodebuf = (uint8_t*)&node;
@@ -315,7 +332,7 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
 	}
 
 	return false;
-}
+}*/
 
 void RPLidar::startMotor(uint8_t pwm) {
     if (_motorPin >= 0) {
