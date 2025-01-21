@@ -63,6 +63,8 @@ bool RPLidar::startScan() {
     if (!verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_SCAN, 5)) {
         return false;
     }
+    // Point function to correct type of response.
+   _scanResponseMode = RESP_TYPE_SCAN;
 
     return true;
 }
@@ -208,8 +210,19 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     
     return true;
 }
-// If we do no processing we can achieve 2100 readings
+
 bool RPLidar::readMeasurement(MeasurementData& measurement) {
+    switch (_scanResponseMode) {
+        case RESP_TYPE_SCAN:
+            return readMeasurementTypeScan(measurement);
+        break;
+
+        default:
+            return false;
+    }
+}
+
+bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 	int counter = 0;
 	rplidar_response_measurement_node_t node;
 	uint8_t *nodeBuffer = (uint8_t*)&node;
@@ -218,9 +231,8 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
 	measurement.errorCount = 0;
 	uint8_t recvPos = 0;
 	_serial.setRxTimeout(0);
+    //TODO: should we add timeout here intead of while(1)?
 	while(1) {
-		//int currentbyte = _serial.read();
-		//if (currentbyte<0) continue;
 		if(_serial.available() <5)
 			continue;
 		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
@@ -284,55 +296,6 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
 	}
 	return true;
 }
-/*
-bool RPLidar::readMeasurement(MeasurementData& measurement) {
-    rplidar_response_measurement_node_t node;
-    uint8_t *nodebuf = (uint8_t*)&node;
-
-	uint8_t recvPos = 0;
-
-	while(1) {
-		int currentbyte = _serial.read();
-		if (currentbyte<0) continue;
-
-		switch (recvPos) {
-			case 0: // expect the sync bit and its reverse in this byte          {
-				{
-					uint8_t tmp = (currentbyte>>1);
-					if ( (tmp ^ currentbyte) & 0x1 ) {
-						// pass
-					} else {
-						continue;
-					}
-
-				}
-				break;
-			case 1: // expect the highest bit to be 1
-				{
-					if (currentbyte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
-						// pass
-					} else {
-						recvPos = 0;
-						continue;
-					}
-				}
-				break;
-		}
-		nodebuf[recvPos++] = currentbyte;
-
-		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
-			// store the data ...
-			measurement.distance = node.distance_q2/4.0f;
-			measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
-			measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
-			measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
-			return true;
-		}
-			
-	}
-
-	return false;
-}*/
 
 void RPLidar::startMotor(uint8_t pwm) {
     if (_motorPin >= 0) {

@@ -6,8 +6,6 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 
-const uint8_t STANDARD_DATA_ROT_START_BITS = 0b00000011; //the lowest 2 bits of the first byte is the rotation_start flag(s)
-const uint8_t STANDARD_DATA_CHECK_BIT = 0b00000001; //the LSBit of the second byte is a check but, should always be 1
 
 #define RPLIDAR_RESP_MEASUREMENT_SYNCBIT        (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT  2
@@ -17,7 +15,7 @@ const uint8_t STANDARD_DATA_CHECK_BIT = 0b00000001; //the LSBit of the second by
 typedef struct _rplidar_response_measurement_node_t {
     uint8_t sync_quality;      // syncbit:1;syncbit_inverse:1;quality:6;
     uint16_t   angle_q6_checkbit; // check_bit:1;angle_q6:15;
-	  uint16_t   distance_q2;
+	uint16_t   distance_q2;
 } __attribute__((packed)) rplidar_response_measurement_node_t;
 
 class RPLidar {
@@ -111,7 +109,9 @@ public:
     bool getSampleRate(DeviceScanRate &scanRate); // Rate is in uSecs
     
     // Data retrieval
-    bool readMeasurement(MeasurementData& measurement);
+    // Declare a function pointer for commin name.
+    bool readMeasurement(MeasurementData&);
+    bool readMeasurementTypeScan(MeasurementData&);
     
     // Motor control
     void startMotor(uint8_t pwm = 255);
@@ -123,10 +123,8 @@ private:
     int _txPin;
     int _motorPin;
     bool _motorEnabled;
+    uint8_t _scanResponseMode; // Stores the current scan response.
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
-    uint8_t _buffer[5]; // 2x of 5
-    uint8_t _unreadBytes = 0; // how many bytes in the buffer are not processed yet
-    uint8_t _startByte = 0; // where in the buffer should we start processing.
 
     // Helper functions
     bool waitResponseHeader();
