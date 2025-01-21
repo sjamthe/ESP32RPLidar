@@ -69,13 +69,19 @@ bool RPLidar::startScan() {
     return true;
 }
 
-bool RPLidar::startExpressScan() {
+bool RPLidar::startExpressScan(uint8_t expressScanType) {
     stop();
     delay(1);
 
-    // Express scan payload
-    uint8_t payload[5] = {0};
-    payload[0] = 0; // Default working mode
+    // Express scan command,payload,checksum expected.
+    // legacy   A5 82 5 0 0 0 0 0 22
+    // extended A5 82 5 2 0 0 0 0 20
+
+    uint8_t payload[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+    if(expressScanType == EXPRESS_TYPE_EXTENDED)
+      payload[0] = EXPRESS_TYPE_EXTENDED;
+    else
+      payload[0] = EXPRESS_TYPE_LEGACY; // For Legacy.
     
     sendCommand(CMD_EXPRESS_SCAN, payload, sizeof(payload));
     
@@ -83,16 +89,23 @@ bool RPLidar::startExpressScan() {
         return false;
     }
 	// Verify response descriptor
-	if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_LEGACY_SCAN, 84)) {
-		Serial.println("Response is of type RESP_TYPE_EXPRESS_LEGACY_SCAN");
-        return true;
+  if(expressScanType == EXPRESS_TYPE_LEGACY) {
+    if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_LEGACY_SCAN, 84)) {
+			Serial.println("Response is of type RESP_TYPE_EXPRESS_LEGACY_SCAN");
+			_scanResponseMode = RESP_TYPE_EXPRESS_LEGACY_SCAN;
+			return true;
+    	} else if(verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_DENSE_SCAN, 84)) {
+			Serial.println("Response is of type RESP_TYPE_EXPRESS_DENSE_SCAN");
+			_scanResponseMode = RESP_TYPE_EXPRESS_DENSE_SCAN;
+			return true;
+	  	}
+	} else {
+    	if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_EXTENDED_SCAN, 132)) {
+		    Serial.println("Response is of type RESP_TYPE_EXPRESS_EXTENDED_SCAN");
+          	_scanResponseMode = RESP_TYPE_EXPRESS_EXTENDED_SCAN;
+          	return true;
+    	}
     }
-    else if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_EXTENDED_SCAN, 132)) {
-		Serial.println("Response is of type RESP_TYPE_EXPRESS_EXTENDED_SCAN");
-        return true;
-    } else if(verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_DENSE_SCAN, 84)) {
-		Serial.println("Response is of type RESP_TYPE_EXPRESS_DENSE_SCAN");
-	}
     
     return false;
 }
@@ -215,11 +228,24 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
     switch (_scanResponseMode) {
         case RESP_TYPE_SCAN:
             return readMeasurementTypeScan(measurement);
-        break;
-
+        	break;
+		case RESP_TYPE_EXPRESS_EXTENDED_SCAN:
+			return readMeasurementTypeExpExtended(measurement);
+		case RESP_TYPE_EXPRESS_LEGACY_SCAN:
+			return readMeasurementTypeExpLegacy(measurement);
         default:
             return false;
     }
+}
+
+bool RPLidar::readMeasurementTypeExpExtended(MeasurementData& measurement) {
+	// TODO:
+	return false;
+}
+
+bool RPLidar::readMeasurementTypeExpLegacy(MeasurementData& measurement) {
+	//TODO:
+	return false;
 }
 
 bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
@@ -331,6 +357,7 @@ void RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSi
             checksum ^= payload[i];
         }
         _serial.write(checksum);
+        Serial.printf("Checksum: 0X%02x\n",checksum);
     }
     
     _serial.flush();

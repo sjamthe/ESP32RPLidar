@@ -36,6 +36,10 @@ public:
 	static const uint8_t SINGLE_RESP_MODE = 0x00;
 	static const uint8_t MULTI_RESP_MODE = 0x01;
 
+  // Express Scan payload
+  static const uint8_t EXPRESS_TYPE_LEGACY = 0x00;
+  static const uint8_t EXPRESS_TYPE_EXTENDED = 0x02;
+
 	// Response types
     static const uint8_t RESP_TYPE_INFO = 0x04;
     static const uint8_t RESP_TYPE_HEALTH = 0x06;
@@ -100,7 +104,7 @@ public:
     bool stop();
     bool reset();
     bool startScan();
-    bool startExpressScan();
+    bool startExpressScan(uint8_t expressScanType = 2);
     bool forceScan();
     
     // Information commands
@@ -111,7 +115,6 @@ public:
     // Data retrieval
     // Declare a function pointer for commin name.
     bool readMeasurement(MeasurementData&);
-    bool readMeasurementTypeScan(MeasurementData&);
     
     // Motor control
     void startMotor(uint8_t pwm = 255);
@@ -132,6 +135,9 @@ private:
     void sendCommand(uint8_t cmd, const uint8_t* payload = nullptr, uint8_t payloadSize = 0);
     uint8_t checksum(const uint8_t* data, uint8_t len);
 	  bool verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedType, uint32_t expectedLength);
+    bool readMeasurementTypeScan(MeasurementData&);
+    bool readMeasurementTypeExpExtended(MeasurementData&);
+    bool readMeasurementTypeExpLegacy(MeasurementData&);
 };
 
 #endif // RPLIDAR_H

@@ -81,7 +81,7 @@ void setup() {
 
     // Start scan
     Serial.println("Starting scan...");
-    if (!lidar.startScan()) {
+    if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
         delay(1000);  // Give time for error message to be sent
         //ESP.restart(); // Restart on scan failure (Should we restart lidar instead of ESP?)
