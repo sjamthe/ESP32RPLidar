@@ -1,15 +1,51 @@
+#include <stdint.h>
 #include <cstdlib>
 #include <cstddef>
 #include "Arduino.h"
 #include <sys/_stdint.h>
-// RPLidar.cpp
 #include "RPLidar.h"
 
-static void convert(const sl_lidar_response_measurement_node_t &from, MeasurementData &measurement) {
-    measurement.distance = from.distance_q2/4.0f;
-    measurement.angle = (from.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
-    measurement.quality = (from.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
-    measurement.startFlag = (from.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel)
+		{
+	static const uint32_t VBS_SCALED_BASE[] = {
+	SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
+	SL_LIDAR_VARBITSCALE_X8_DEST_VAL,
+	SL_LIDAR_VARBITSCALE_X4_DEST_VAL,
+	SL_LIDAR_VARBITSCALE_X2_DEST_VAL,
+			0,
+	};
+
+	static const uint32_t VBS_SCALED_LVL[] = {
+			4,
+			3,
+			2,
+			1,
+			0,
+	};
+
+	static const uint32_t VBS_TARGET_BASE[] = {
+			(0x1 << SL_LIDAR_VARBITSCALE_X16_SRC_BIT),
+			(0x1 << SL_LIDAR_VARBITSCALE_X8_SRC_BIT),
+			(0x1 << SL_LIDAR_VARBITSCALE_X4_SRC_BIT),
+			(0x1 << SL_LIDAR_VARBITSCALE_X2_SRC_BIT),
+			0,
+	};
+
+	for (size_t i = 0; i < _countof(VBS_SCALED_BASE); ++i) {
+		int remain = ((int) scaled - (int) VBS_SCALED_BASE[i]);
+		if (remain >= 0) {
+			scaleLevel = VBS_SCALED_LVL[i];
+			return VBS_TARGET_BASE[i] + (remain << scaleLevel);
+		}
+	}
+	return 0;
+}
+
+static void convert(const sl_lidar_response_measurement_node_t &from, MeasurementData &to) {
+    to.distance = from.distance_q2/4.0f;
+    to.angle = (from.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
+    to.quality = (from.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+    to.startFlag = (from.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
 }
 
 static void convert(const sl_lidar_response_measurement_node_hq_t &from, MeasurementData &measurement) {
@@ -246,25 +282,26 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     return true;
 }
 
-bool RPLidar::readMeasurement(MeasurementData& measurement) {
+sl_result RPLidar::readMeasurement(MeasurementData* measurements, size_t& count) {
     switch (_scanResponseMode) {
         case RESP_TYPE_SCAN:
-            return readMeasurementTypeScan(measurement);
+            return readMeasurementTypeScan(measurements, count);
         	break;
 		case RESP_TYPE_EXPRESS_EXTENDED_SCAN:
-			return readMeasurementTypeExpExtended(measurement);
+			return readMeasurementTypeExpExtended(measurements, count);
 		case RESP_TYPE_EXPRESS_LEGACY_SCAN:
-			return readMeasurementTypeExpLegacy(measurement);
+			return readMeasurementTypeExpLegacy(measurements, count);
         default:
-            return false;
+            return SL_RESULT_FORMAT_NOT_SUPPORT;
     }
 }
 
 
-bool RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_TIMEOUT_MS)
+sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout)
         {
     if (!_isConnected) {
-        return false ;
+        _scanning = false;
+        return SL_RESULT_OPERATION_FAIL;
     }
 
     int recvPos = 0;
@@ -295,6 +332,7 @@ bool RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement
                         // pass
                     }
                     else {
+                        _is_previous_capsuledataRdy = false;
                         continue;
                     }
                 }
@@ -307,6 +345,7 @@ bool RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement
                     }
                     else {
                         recvPos = 0;
+                        _is_previous_capsuledataRdy = false;
                         continue;
                     }
                 }
@@ -326,20 +365,23 @@ bool RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement
 
                 if (recvChecksum == checksum) {
                     // only consider vaild if the checksum matches...
-                    //if (node.start_angle_sync_q6 & RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT) {
-                    //    return true ;
-                    //}
-                    return true ;
+                    if (node.start_angle_sync_q6 & RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT) {
+                        _is_previous_capsuledataRdy = false;
+                        return SL_RESULT_OK ;
+                    }
+                    return SL_RESULT_OK ;
                 }
-                return false ;
+                _is_previous_capsuledataRdy = false;
+                return SL_RESULT_INVALID_DATA ;
             }
         }
     }
-    return false ;
+    _is_previous_capsuledataRdy = false;
+    return SL_RESULT_OPERATION_TIMEOUT ;
 }
-/*
-void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, sl_lidar_response_measurement_node_hq_t *nodebuffer, size_t &nodeCount)
-        {
+
+void RPLidar::_ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount)
+    {
     nodeCount = 0;
     if (_is_previous_capsuledataRdy) {
         int diffAngle_q8;
@@ -358,7 +400,7 @@ void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nod
             int angle_q6[3];
             int syncBit[3];
 
-            sl_u32 combined_x3 = _cached_previous_ultracapsuledata.ultra_cabins[pos].combined_x3;
+            uint32_t combined_x3 = _cached_previous_ultracapsuledata.ultra_cabins[pos].combined_x3;
 
             // unpack ...
             int dist_major = (combined_x3 & 0xFFF);
@@ -371,7 +413,7 @@ void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nod
 
             int dist_major2;
 
-            sl_u32 scalelvl1, scalelvl2;
+            uint32_t scalelvl1, scalelvl2;
 
             // prefetch next ...
             if (pos == _countof(_cached_previous_ultracapsuledata.ultra_cabins) - 1) {
@@ -435,44 +477,50 @@ void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nod
                 sl_lidar_response_measurement_node_hq_t node;
 
                 node.flag = (syncBit[cpos] | ((!syncBit[cpos]) << 1));
-                node.quality = dist_q2[cpos] ? (0x2F << SL_LIDAR_RESP_MEASUREMENT_QUALITY_SHIFT) : 0;
-                node.angle_z_q14 = sl_u16((angle_q6[cpos] << 8) / 90);
+                node.quality = dist_q2[cpos] ? (0x2F << RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT) : 0;
+                node.angle_z_q14 = uint16_t((angle_q6[cpos] << 8) / 90);
                 node.dist_mm_q2 = dist_q2[cpos];
 
-                nodebuffer[nodeCount++] = node;
+                convert(node, measurements[nodeCount]);
+                nodeCount++;
             }
-
         }
     }
 
     _cached_previous_ultracapsuledata = capsule;
     _is_previous_capsuledataRdy = true;
-}*/
+}
 
-bool RPLidar::readMeasurementTypeExpExtended(MeasurementData& measurement) {
+sl_result RPLidar::readMeasurementTypeExpExtended(MeasurementData* measurements, size_t &count) {
     sl_lidar_response_ultra_capsule_measurement_nodes_t node;
-	return _waitUltraCapsuledNode(node, READ_TIMEOUT_MS);
-	//return false;
+	
+    sl_result ans = _waitUltraCapsuledNode(node, READ_EXP_TIMEOUT_MS);
+    if (ans != SL_RESULT_OK) {
+        return ans;
+    }
+    _ultraCapsuleToNormal(node, measurements, count);
+	return SL_RESULT_OK;
 }
 
-bool RPLidar::readMeasurementTypeExpLegacy(MeasurementData& measurement) {
+sl_result RPLidar::readMeasurementTypeExpLegacy(MeasurementData* measurements, size_t &count) {
 	//TODO:
-	return false;
+	return SL_RESULT_OPERATION_NOT_SUPPORT;
 }
 
-bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
+sl_result RPLidar::readMeasurementTypeScan(MeasurementData* measurements, size_t& nodeCount) {
 	int counter = 0;
 	sl_lidar_response_measurement_node_t node;
 	uint8_t *nodeBuffer = (uint8_t*)&node;
 	uint8_t recvBuffer[sizeof(sl_lidar_response_measurement_node_t)];
     uint32_t startTs =  millis();
     uint32_t waitTime = 0;
+    nodeCount = 0;
 
-	measurement.errorCount = 0;
 	uint8_t recvPos = 0;
 	_serial.setRxTimeout(0);
     //TODO: should we add timeout here intead of while(1)?
 	while((waitTime =  millis() - startTs) <= READ_TIMEOUT_MS) {
+
 		if(_serial.available() < sizeof(recvBuffer))
 			continue;
 		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
@@ -492,7 +540,6 @@ bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 						// pass
 					}
 					else {
-						measurement.errorCount++;
 						continue;
 					}
 
@@ -505,20 +552,17 @@ bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 					}
 					else {
 						recvPos = 0;
-						measurement.errorCount++;
 						continue;
 					}
 				}
 				break;
 			}
-			if(measurement.errorCount) break;
 			nodeBuffer[recvPos++] = currentByte;
 
 			if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
 				break;
 			}
 		}
-		if(measurement.errorCount) break;
 		if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
 			break;
 		}
@@ -526,17 +570,14 @@ bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 
 	// store the data ...
 	if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
-		/*measurement.distance = node.distance_q2/4.0f;
-		measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
-		measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
-		measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);*/
-        convert(node, measurement);
-		return true;
+        convert(node, measurements[nodeCount]);
+		nodeCount++;
+		return SL_RESULT_OK;
 	}
-    if(!measurement.errorCount) {
-        measurement.errorCount++; // Timeout error.
+    else {
+        return SL_RESULT_INVALID_DATA;
     }
-	return false;
+	return SL_RESULT_OPERATION_TIMEOUT;
 }
 
 void RPLidar::startMotor(uint8_t pwm) {
@@ -573,7 +614,6 @@ void RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSi
             checksum ^= payload[i];
         }
         _serial.write(checksum);
-        Serial.printf("Checksum: 0X%02x\n",checksum);
     }
     
     _serial.flush();

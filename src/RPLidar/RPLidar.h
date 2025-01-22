@@ -5,14 +5,15 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include "util.h"
 
+typedef uint32_t sl_result;
 
 #define RPLIDAR_RESP_MEASUREMENT_SYNCBIT        (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT  2
 #define RPLIDAR_RESP_MEASUREMENT_CHECKBIT       (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT    1
 #define RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT    (0x1<<15)
-
 
 typedef struct _sl_lidar_response_measurement_node_t {
     uint8_t sync_quality;      // syncbit:1;syncbit_inverse:1;quality:6;
@@ -49,7 +50,6 @@ struct MeasurementData {
 	float distance;     // In millimeters
 	uint8_t quality;    // Quality of measurement
 	bool startFlag;     // Start flag for new scan
-	unsigned long errorCount;
 };
 
 class RPLidar {
@@ -73,6 +73,7 @@ public:
     // Express Scan payload
     static const uint8_t EXPRESS_TYPE_LEGACY = 0x00;
     static const uint8_t EXPRESS_TYPE_EXTENDED = 0x02;
+	static const uint8_t EXPRESS_MEASUREMENTS_PER_SCAN = 96; // Number of Measurements per scan call.
 
 	// Response types
     static const uint8_t RESP_TYPE_INFO = 0x04;
@@ -93,7 +94,8 @@ public:
 
     // Measurement quality threshold
     static const uint8_t MIN_QUALITY = 0;
-    static const uint16_t READ_TIMEOUT_MS = 200;  // 200ms timeout for reading
+    static const uint16_t READ_TIMEOUT_MS = 200;  
+    static const uint16_t READ_EXP_TIMEOUT_MS = 100; 
 
     // Structure for device info
     struct DeviceInfo {
@@ -143,7 +145,7 @@ public:
     
     // Data retrieval
     // Declare a function pointer for commin name.
-    bool readMeasurement(MeasurementData&);
+    sl_result readMeasurement(MeasurementData*, size_t&);
     
     // Motor control
     void startMotor(uint8_t pwm = 255);
@@ -156,8 +158,11 @@ private:
     int _motorPin;
     bool _motorEnabled;
     bool _isConnected;
+    bool _scanning;
     uint8_t _scanResponseMode; // Stores the current scan response.
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
+    bool _is_previous_capsuledataRdy;
+    sl_lidar_response_ultra_capsule_measurement_nodes_t _cached_previous_ultracapsuledata;
 
     // Helper functions
     bool waitResponseHeader();
@@ -165,10 +170,44 @@ private:
     void sendCommand(uint8_t cmd, const uint8_t* payload = nullptr, uint8_t payloadSize = 0);
     uint8_t checksum(const uint8_t* data, uint8_t len);
 	  bool verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedType, uint32_t expectedLength);
-    bool readMeasurementTypeScan(MeasurementData&);
-    bool readMeasurementTypeExpExtended(MeasurementData&);
-    bool readMeasurementTypeExpLegacy(MeasurementData&);
-    bool _waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_TIMEOUT_MS);
+    sl_result readMeasurementTypeScan(MeasurementData*, size_t&);
+    sl_result readMeasurementTypeExpExtended(MeasurementData*, size_t&);
+    sl_result readMeasurementTypeExpLegacy(MeasurementData*, size_t&);
+    sl_result _waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_EXP_TIMEOUT_MS);
+    void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
 };
+
+// Definition of the variable bit scale encoding mechanism
+#define SL_LIDAR_VARBITSCALE_X2_SRC_BIT  9
+#define SL_LIDAR_VARBITSCALE_X4_SRC_BIT  11
+#define SL_LIDAR_VARBITSCALE_X8_SRC_BIT  12
+#define SL_LIDAR_VARBITSCALE_X16_SRC_BIT 14
+
+#define SL_LIDAR_VARBITSCALE_X2_DEST_VAL 512
+#define SL_LIDAR_VARBITSCALE_X4_DEST_VAL 1280
+#define SL_LIDAR_VARBITSCALE_X8_DEST_VAL 1792
+#define SL_LIDAR_VARBITSCALE_X16_DEST_VAL 3328
+
+#define SL_LIDAR_VARBITSCALE_GET_SRC_MAX_VAL_BY_BITS(_BITS_) \
+    (  (((0x1<<(_BITS_)) - SL_LIDAR_VARBITSCALE_X16_DEST_VAL)<<4) + \
+       ((SL_LIDAR_VARBITSCALE_X16_DEST_VAL - SL_LIDAR_VARBITSCALE_X8_DEST_VAL)<<3) + \
+       ((SL_LIDAR_VARBITSCALE_X8_DEST_VAL - SL_LIDAR_VARBITSCALE_X4_DEST_VAL)<<2) + \
+       ((SL_LIDAR_VARBITSCALE_X4_DEST_VAL - SL_LIDAR_VARBITSCALE_X2_DEST_VAL)<<1) + \
+       SL_LIDAR_VARBITSCALE_X2_DEST_VAL - 1)
+
+
+#define SL_RESULT_OK                     (sl_result)0
+#define SL_RESULT_FAIL_BIT               (sl_result)0x80000000
+#define SL_RESULT_ALREADY_DONE           (sl_result)0x20
+#define SL_RESULT_INVALID_DATA           (sl_result)(0x8000 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_OPERATION_FAIL         (sl_result)(0x8001 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_OPERATION_TIMEOUT      (sl_result)(0x8002 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_OPERATION_STOP         (sl_result)(0x8003 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_OPERATION_NOT_SUPPORT  (sl_result)(0x8004 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_FORMAT_NOT_SUPPORT     (sl_result)(0x8005 | SL_RESULT_FAIL_BIT)
+#define SL_RESULT_INSUFFICIENT_MEMORY    (sl_result)(0x8006 | SL_RESULT_FAIL_BIT)
+
+#define SL_IS_OK(x)    ( ((x) & SL_RESULT_FAIL_BIT) == 0 )
+#define SL_IS_FAIL(x)  ( ((x) & SL_RESULT_FAIL_BIT) )
 
 #endif // RPLIDAR_H

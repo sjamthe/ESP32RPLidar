@@ -98,6 +98,7 @@ unsigned long startMillis = 0;
 unsigned long measurementCount = 0;
 unsigned long rpsCount = 0;
 unsigned long errorCount = 0;
+unsigned long timeoutCount = 0;
 bool firstMeasurement = true;
 
 void loop1() {
@@ -105,44 +106,41 @@ void loop1() {
 }
 
 void loop() {
-    MeasurementData measurement;
+    MeasurementData measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN];
+    size_t count = 0;
     
-    if (lidar.readMeasurement(measurement)) {
+	sl_result ans = lidar.readMeasurement(measurements, count);
+    if (ans == SL_RESULT_OK) {
         if (firstMeasurement) {
             Serial.println("First measurement received!");
             startMillis = millis();
             firstMeasurement = false;
         }
-        
-        //if (measurement.quality >= RPLidar::MIN_QUALITY) {
-            //measurementCount++;
-            if(measurement.errorCount)
-              errorCount++;
-            else
-             measurementCount++;
+             
+		measurementCount+= count;
 
-            if(measurement.startFlag) {
-              rpsCount++;
-            }
-            
-            // Print stats every second
-            unsigned long now = millis();
-            if ((now - startMillis) > 10000) {
-                Serial.printf("Errors: %u, Measurements %u, Measurements per second: %04.0f, rps %04.0f\n",
-                 errorCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
-                Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
-                             measurement.angle, measurement.distance, measurement.quality);
-                startMillis = millis();
-                measurementCount = 0;
-                rpsCount = 0;
-                errorCount = 0;
-            }
-        //}
+		for (int i=0; i<count; i++) {
+			if(measurements[i].startFlag) {
+			rpsCount++;
+			}
+		}		
+		// Print stats every second
+		unsigned long now = millis();
+		if ((now - startMillis) > 10000) {
+			Serial.printf("Errors: %u. Timeouts: %u, Measurements: %u, Measurements per second: %04.0f, rps: %04.0f\n",
+				errorCount, timeoutCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
+			Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+							measurements[0].angle, measurements[0].distance, measurements[0].quality);
+			startMillis = millis();
+			measurementCount = 0;
+			rpsCount = 0;
+			errorCount = 0;
+		}
     } 
-    /*else {
-        if (millis() - lastPrint >= 1000) {
-            Serial.println("No measurements received in last second");
-            lastPrint = millis();
-        }
-    }*/
+    else {
+        if(ans == SL_RESULT_OPERATION_TIMEOUT)
+			timeoutCount++;
+		else
+		 	errorCount++;
+    }
 }
