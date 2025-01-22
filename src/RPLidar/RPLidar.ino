@@ -81,6 +81,7 @@ void setup() {
 
     // Start scan
     Serial.println("Starting scan...");
+    //if (!lidar.startScan()) {
     if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
         delay(1000);  // Give time for error message to be sent
@@ -104,7 +105,7 @@ void loop1() {
 }
 
 void loop() {
-    RPLidar::MeasurementData measurement;
+    MeasurementData measurement;
     
     if (lidar.readMeasurement(measurement)) {
         if (firstMeasurement) {
@@ -129,8 +130,8 @@ void loop() {
             if ((now - startMillis) > 10000) {
                 Serial.printf("Errors: %u, Measurements %u, Measurements per second: %04.0f, rps %04.0f\n",
                  errorCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
-                //Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
-                //             measurement.angle, measurement.distance, measurement.quality);
+                Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+                             measurement.angle, measurement.distance, measurement.quality);
                 startMillis = millis();
                 measurementCount = 0;
                 rpsCount = 0;

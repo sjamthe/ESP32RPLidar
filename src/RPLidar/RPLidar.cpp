@@ -5,8 +5,24 @@
 // RPLidar.cpp
 #include "RPLidar.h"
 
+static void convert(const sl_lidar_response_measurement_node_t &from, MeasurementData &measurement) {
+    measurement.distance = from.distance_q2/4.0f;
+    measurement.angle = (from.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
+    measurement.quality = (from.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+    measurement.startFlag = (from.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+}
+
+static void convert(const sl_lidar_response_measurement_node_hq_t &from, MeasurementData &measurement) {
+    sl_lidar_response_measurement_node_t to;
+	to.sync_quality = (from.flag & RPLIDAR_RESP_MEASUREMENT_SYNCBIT) | ((from.quality >> RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT) << RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+	to.angle_q6_checkbit = 1 | (((from.angle_z_q14 * 90) >> 8) << RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT);
+	to.distance_q2 = from.dist_mm_q2 > uint16_t(-1) ? uint16_t(0) : uint16_t(from.dist_mm_q2);
+
+    convert(to, measurement);
+}
+
 RPLidar::RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin)
-    : _serial(serial), _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _motorEnabled(false) {
+    : _serial(serial), _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
 }
 
 bool RPLidar::begin(unsigned long baud) {
@@ -17,6 +33,7 @@ bool RPLidar::begin(unsigned long baud) {
     // Initialize serial
     _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
     delay(500);  // Give time for serial to initialize
+    _isConnected = true;
     
     // Setup motor pin if provided
     if (_motorPin >= 0) {
@@ -33,6 +50,7 @@ bool RPLidar::begin(unsigned long baud) {
 void RPLidar::end() {
     stopMotor();
     _serial.end();
+    _isConnected = false;
 }
 
 bool RPLidar::stop() {
@@ -48,6 +66,8 @@ bool RPLidar::reset() {
 }
 
 bool RPLidar::startScan() {
+    if(!_isConnected) return false; // Don't start scan if not connected.
+
     // Stop any previous operation
     stop();
     delay(1);
@@ -70,12 +90,14 @@ bool RPLidar::startScan() {
 }
 
 bool RPLidar::startExpressScan(uint8_t expressScanType) {
+    if(!_isConnected) return false; // Don't start scan if not connected.
+
     stop();
     delay(1);
 
     // Express scan command,payload,checksum expected.
-    // legacy   A5 82 5 0 0 0 0 0 22
-    // extended A5 82 5 2 0 0 0 0 20
+    // legacy   82 5 0 0 0 0 22
+    // extended 82 5 2 0 0 0 20
 
     uint8_t payload[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
     if(expressScanType == EXPRESS_TYPE_EXTENDED)
@@ -238,9 +260,199 @@ bool RPLidar::readMeasurement(MeasurementData& measurement) {
     }
 }
 
+
+bool RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_TIMEOUT_MS)
+        {
+    if (!_isConnected) {
+        return false ;
+    }
+
+    int recvPos = 0;
+    uint32_t startTs = millis();
+    uint8_t recvBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];
+    uint8_t *nodeBuffer = (uint8_t*) &node;
+    uint32_t waitTime;
+    size_t recvSize = sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t);
+
+    while ((waitTime = millis() - startTs) <= timeout) {
+
+        if(_serial.available() < recvSize)
+			continue;
+
+		size_t bytesRead = _serial.readBytes(recvBuffer, recvSize);
+		if(bytesRead < recvSize) {
+			Serial.println("Error: read less than available should not happen");
+			continue;
+		}
+
+        for (size_t pos = 0; pos < recvSize; ++pos) {
+            uint8_t currentByte = recvBuffer[pos];
+            switch (recvPos) {
+                case 0: // expect the sync bit 1
+                {
+                    uint8_t tmp = (currentByte >> 4);
+                    if (tmp == RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1) {
+                        // pass
+                    }
+                    else {
+                        continue;
+                    }
+                }
+                    break;
+                case 1: // expect the sync bit 2
+                {
+                    uint8_t tmp = (currentByte >> 4);
+                    if (tmp == RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2) {
+                        // pass
+                    }
+                    else {
+                        recvPos = 0;
+                        continue;
+                    }
+                }
+                    break;
+            }
+            nodeBuffer[recvPos++] = currentByte;
+            if (recvPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
+                // calc the checksum ...
+                uint8_t checksum = 0;
+                uint8_t recvChecksum = ((node.s_checksum_1 & 0xF) | (node.s_checksum_2 << 4));
+
+                for (size_t cpos = offsetof(sl_lidar_response_ultra_capsule_measurement_nodes_t, start_angle_sync_q6);
+                        cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos)
+                        {
+                    checksum ^= nodeBuffer[cpos];
+                }
+
+                if (recvChecksum == checksum) {
+                    // only consider vaild if the checksum matches...
+                    //if (node.start_angle_sync_q6 & RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT) {
+                    //    return true ;
+                    //}
+                    return true ;
+                }
+                return false ;
+            }
+        }
+    }
+    return false ;
+}
+/*
+void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, sl_lidar_response_measurement_node_hq_t *nodebuffer, size_t &nodeCount)
+        {
+    nodeCount = 0;
+    if (_is_previous_capsuledataRdy) {
+        int diffAngle_q8;
+        int currentStartAngle_q8 = ((capsule.start_angle_sync_q6 & 0x7FFF) << 2);
+        int prevStartAngle_q8 = ((_cached_previous_ultracapsuledata.start_angle_sync_q6 & 0x7FFF) << 2);
+
+        diffAngle_q8 = (currentStartAngle_q8) - (prevStartAngle_q8);
+        if (prevStartAngle_q8 > currentStartAngle_q8) {
+            diffAngle_q8 += (360 << 8);
+        }
+
+        int angleInc_q16 = (diffAngle_q8 << 3) / 3;
+        int currentAngle_raw_q16 = (prevStartAngle_q8 << 8);
+        for (size_t pos = 0; pos < _countof(_cached_previous_ultracapsuledata.ultra_cabins); ++pos) {
+            int dist_q2[3];
+            int angle_q6[3];
+            int syncBit[3];
+
+            sl_u32 combined_x3 = _cached_previous_ultracapsuledata.ultra_cabins[pos].combined_x3;
+
+            // unpack ...
+            int dist_major = (combined_x3 & 0xFFF);
+
+            // signed partical integer, using the magic shift here
+            // DO NOT TOUCH
+
+            int dist_predict1 = (((int) (combined_x3 << 10)) >> 22);
+            int dist_predict2 = (((int) combined_x3) >> 22);
+
+            int dist_major2;
+
+            sl_u32 scalelvl1, scalelvl2;
+
+            // prefetch next ...
+            if (pos == _countof(_cached_previous_ultracapsuledata.ultra_cabins) - 1) {
+                dist_major2 = (capsule.ultra_cabins[0].combined_x3 & 0xFFF);
+            }
+            else {
+                dist_major2 = (_cached_previous_ultracapsuledata.ultra_cabins[pos + 1].combined_x3 & 0xFFF);
+            }
+
+            // decode with the var bit scale ...
+            dist_major = _varbitscale_decode(dist_major, scalelvl1);
+            dist_major2 = _varbitscale_decode(dist_major2, scalelvl2);
+
+            int dist_base1 = dist_major;
+            int dist_base2 = dist_major2;
+
+            if ((!dist_major) && dist_major2) {
+                dist_base1 = dist_major2;
+                scalelvl1 = scalelvl2;
+            }
+
+            dist_q2[0] = (dist_major << 2);
+            if ((dist_predict1 == 0xFFFFFE00) || (dist_predict1 == 0x1FF)) {
+                dist_q2[1] = 0;
+            }
+            else {
+                dist_predict1 = (dist_predict1 << scalelvl1);
+                dist_q2[1] = (dist_predict1 + dist_base1) << 2;
+
+            }
+
+            if ((dist_predict2 == 0xFFFFFE00) || (dist_predict2 == 0x1FF)) {
+                dist_q2[2] = 0;
+            }
+            else {
+                dist_predict2 = (dist_predict2 << scalelvl2);
+                dist_q2[2] = (dist_predict2 + dist_base2) << 2;
+            }
+
+            for (int cpos = 0; cpos < 3; ++cpos) {
+                syncBit[cpos] = (((currentAngle_raw_q16 + angleInc_q16) % (360 << 16)) < angleInc_q16) ? 1 : 0;
+
+                int offsetAngleMean_q16 = (int) (7.5 * 3.1415926535 * (1 << 16) / 180.0);
+
+                if (dist_q2[cpos] >= (50 * 4))
+                        {
+                    const int k1 = 98361;
+                    const int k2 = int(k1 / dist_q2[cpos]);
+
+                    offsetAngleMean_q16 = (int) (8 * 3.1415926535 * (1 << 16) / 180) - (k2 << 6) - (k2 * k2 * k2) / 98304;
+                }
+
+                angle_q6[cpos] = ((currentAngle_raw_q16 - int(offsetAngleMean_q16 * 180 / 3.14159265)) >> 10);
+                currentAngle_raw_q16 += angleInc_q16;
+
+                if (angle_q6[cpos] < 0)
+                    angle_q6[cpos] += (360 << 6);
+                if (angle_q6[cpos] >= (360 << 6))
+                    angle_q6[cpos] -= (360 << 6);
+
+                sl_lidar_response_measurement_node_hq_t node;
+
+                node.flag = (syncBit[cpos] | ((!syncBit[cpos]) << 1));
+                node.quality = dist_q2[cpos] ? (0x2F << SL_LIDAR_RESP_MEASUREMENT_QUALITY_SHIFT) : 0;
+                node.angle_z_q14 = sl_u16((angle_q6[cpos] << 8) / 90);
+                node.dist_mm_q2 = dist_q2[cpos];
+
+                nodebuffer[nodeCount++] = node;
+            }
+
+        }
+    }
+
+    _cached_previous_ultracapsuledata = capsule;
+    _is_previous_capsuledataRdy = true;
+}*/
+
 bool RPLidar::readMeasurementTypeExpExtended(MeasurementData& measurement) {
-	// TODO:
-	return false;
+    sl_lidar_response_ultra_capsule_measurement_nodes_t node;
+	return _waitUltraCapsuledNode(node, READ_TIMEOUT_MS);
+	//return false;
 }
 
 bool RPLidar::readMeasurementTypeExpLegacy(MeasurementData& measurement) {
@@ -250,19 +462,21 @@ bool RPLidar::readMeasurementTypeExpLegacy(MeasurementData& measurement) {
 
 bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 	int counter = 0;
-	rplidar_response_measurement_node_t node;
+	sl_lidar_response_measurement_node_t node;
 	uint8_t *nodeBuffer = (uint8_t*)&node;
-	uint8_t recvBuffer[5];
+	uint8_t recvBuffer[sizeof(sl_lidar_response_measurement_node_t)];
+    uint32_t startTs =  millis();
+    uint32_t waitTime = 0;
 
 	measurement.errorCount = 0;
 	uint8_t recvPos = 0;
 	_serial.setRxTimeout(0);
     //TODO: should we add timeout here intead of while(1)?
-	while(1) {
-		if(_serial.available() <5)
+	while((waitTime =  millis() - startTs) <= READ_TIMEOUT_MS) {
+		if(_serial.available() < sizeof(recvBuffer))
 			continue;
 		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
-		if(bytesRead < 5) {
+		if(bytesRead < sizeof(recvBuffer)) {
 			Serial.println("Error: read less than available should not happen");
 			continue;
 		}
@@ -283,7 +497,7 @@ bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 					}
 
 				}
-					break;
+				break;
 				case 1: // expect the highest bit to be 1
 				{
 					if (currentByte & RPLIDAR_RESP_MEASUREMENT_CHECKBIT) {
@@ -295,32 +509,34 @@ bool RPLidar::readMeasurementTypeScan(MeasurementData& measurement) {
 						continue;
 					}
 				}
-					break;
-			}
-			if(measurement.errorCount)
 				break;
+			}
+			if(measurement.errorCount) break;
 			nodeBuffer[recvPos++] = currentByte;
 
-			if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+			if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
 				break;
 			}
 		}
-		if(measurement.errorCount)
-				break;
-		if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
+		if(measurement.errorCount) break;
+		if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
 			break;
 		}
 	}
 
 	// store the data ...
-	if (recvPos == sizeof(rplidar_response_measurement_node_t)) {
-		measurement.distance = node.distance_q2/4.0f;
+	if (recvPos == sizeof(sl_lidar_response_measurement_node_t)) {
+		/*measurement.distance = node.distance_q2/4.0f;
 		measurement.angle = (node.angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT)/64.0f;
 		measurement.quality = (node.sync_quality>>RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
-		measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);
+		measurement.startFlag = (node.sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT);*/
+        convert(node, measurement);
 		return true;
 	}
-	return true;
+    if(!measurement.errorCount) {
+        measurement.errorCount++; // Timeout error.
+    }
+	return false;
 }
 
 void RPLidar::startMotor(uint8_t pwm) {
