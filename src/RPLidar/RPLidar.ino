@@ -8,7 +8,7 @@ serialNumber (HEX): 81 53 9D F1 C3 E3 9A C4 C3 E6 98 F9 71 84 34 0D
  */
 #include "RPLidar.h"
 
-RPLidar lidar(Serial2, 16, 17, 25); 
+RPLidar lidar(Serial2, 16, 17, 5); 
 
 void setup() {
     // Start USB serial for debugging and wait for port to be ready
@@ -106,7 +106,7 @@ void loop1() {
 }
 
 void loop() {
-    MeasurementData measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN];
+  MeasurementData measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN];
     size_t count = 0;
     
 	sl_result ans = lidar.readMeasurement(measurements, count);
@@ -129,8 +129,12 @@ void loop() {
 		if ((now - startMillis) > 10000) {
 			Serial.printf("Errors: %u. Timeouts: %u, Measurements: %u, Measurements per second: %04.0f, rps: %04.0f\n",
 				errorCount, timeoutCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
-			Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+			Serial.printf("First measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
 							measurements[0].angle, measurements[0].distance, measurements[0].quality);
+			Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].angle,
+							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].distance,
+							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].quality);
 			startMillis = millis();
 			measurementCount = 0;
 			rpsCount = 0;
