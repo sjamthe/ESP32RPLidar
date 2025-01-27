@@ -8,6 +8,21 @@ serialNumber (HEX): 81 53 9D F1 C3 E3 9A C4 C3 E6 98 F9 71 84 34 0D
  */
 #include "RPLidar.h"
 
+typedef void (*node_callback_t)(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count);
+// Task parameters structure
+typedef struct {
+    node_callback_t callback;
+    // Add other parameters if needed
+} task_params_t;
+
+// Example callback implementation
+void process_nodes(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count) {
+    //Serial.printf("node_callback for nodes: %d\n",count);
+	Serial.print(".");
+    // Process batch of nodes here. We probably should send a message to another task and freeup this task.
+
+}
+
 void setupLidar();
 extern void process_data_task(void *arg);
 extern void uart_rx_task(void *arg);
@@ -96,8 +111,15 @@ void setupLidar() {
     // Start scan
     Serial.println("Starting scan...");
     xTaskCreate(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL);
-    xTaskCreate(process_data_task, "process", 2048, NULL, 4, NULL);
-    //if (!lidar.startScan()) {
+
+    task_params_t* params = (task_params_t*)malloc(sizeof(task_params_t));
+	if(params == NULL) {
+		Serial.println("Error: params is NULL");
+		return;
+	}
+    params->callback = process_nodes;
+    xTaskCreate(process_data_task, "process_data", 8192, (void*)params, 4, NULL);
+
     if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
         delay(1000);  // Give time for error message to be sent

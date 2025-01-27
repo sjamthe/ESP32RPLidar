@@ -6,6 +6,13 @@
 RingbufHandle_t uart_ring_buf;
 static uint8_t temp_buffer[UART_RX_BUF_SIZE];
 
+typedef void (*node_callback_t)(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count);
+
+typedef struct {
+    node_callback_t callback;
+    // Add other parameters if needed
+} task_params_t;
+
 void setup_uart_dma(void) {
     uart_config_t uart_config = {
         .baud_rate = 115200,
@@ -66,14 +73,29 @@ void uart_rx_task(void *arg) {
 }
 
 void process_data_task(void *arg) {
+    task_params_t* params = (task_params_t*)arg;
+    node_callback_t node_callback = params->callback;
+    
     uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];  // Temporary buffer for processing chunks
     size_t processPos = 0;    // Position in current processing chunk
-    size_t items = 0; // Number of items
+    uint32_t lastProcessTime = millis();
+
+    // Buffer for accumulating nodes
+    sl_lidar_response_ultra_capsule_measurement_nodes_t nodeBuffer[10];
+    size_t nodeCount = 0;
     
     while(1) {
         size_t item_size;
         uint8_t *item = (uint8_t *)xRingbufferReceive(uart_ring_buf, &item_size, pdMS_TO_TICKS(100));
         
+        // Check timeout
+        uint32_t currentTime = millis();
+        if (currentTime - lastProcessTime >= 100 && nodeCount > 0) {
+            node_callback(nodeBuffer, nodeCount);
+            nodeCount = 0;
+            lastProcessTime = currentTime;
+        }  
+
         if(item != NULL) {
             uint32_t startTs = millis();
             
@@ -115,12 +137,12 @@ void process_data_task(void *arg) {
                             }
                             
                             if(recvChecksum == checksum) {
-                                // Valid packet - process it
-                                //process_valid_packet(node);
-                                items++;
-                                if(items >= 1000) {
-                                    Serial.printf("Items: %d\n", items);
-                                    items = 0;
+                                memcpy(&nodeBuffer[nodeCount++], node, sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t));
+                                
+                                if(nodeCount >= 10) {
+                                    node_callback(nodeBuffer, nodeCount);
+                                    nodeCount = 0;
+                                    lastProcessTime = currentTime;
                                 }
                             }
                             
