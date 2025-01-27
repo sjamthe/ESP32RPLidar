@@ -57,18 +57,21 @@ static void convert(const sl_lidar_response_measurement_node_hq_t &from, Measure
     convert(to, measurement);
 }
 
+extern void setup_uart_dma(void);
 RPLidar::RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin)
     : _serial(serial), _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
 }
 
 bool RPLidar::begin(unsigned long baud) {
-    // End any previous serial connection
+    /** End any previous serial connection
     _serial.end();
     delay(100);  // Give time for serial to fully close
     
     // Initialize serial
-    _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
-    delay(500);  // Give time for serial to initialize
+    _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);*/
+
+    setup_uart_dma();
+    delay(1000);  // Give time for serial to initialize
     _isConnected = true;
     
     // Setup motor pin if provided
@@ -197,7 +200,7 @@ bool RPLidar::getHealth(DeviceHealth& health) {
     
     // Read data according to length from descriptor
     uint8_t buffer[3];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -228,7 +231,7 @@ bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
     
     // Read data according to length from descriptor
     uint8_t buffer[expectedLength];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -259,7 +262,7 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     
     // Read data according to length from descriptor
     uint8_t buffer[20];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -313,10 +316,10 @@ sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measur
 
     while ((waitTime = millis() - startTs) <= timeout) {
 
-        if(_serial.available() < recvSize)
+        if(available() < recvSize)
 			continue;
 
-		size_t bytesRead = _serial.readBytes(recvBuffer, recvSize);
+		size_t bytesRead = readBytes(recvBuffer, recvSize);
 		if(bytesRead < recvSize) {
 			Serial.println("Error: read less than available should not happen");
 			continue;
@@ -517,13 +520,13 @@ sl_result RPLidar::readMeasurementTypeScan(MeasurementData* measurements, size_t
     nodeCount = 0;
 
 	uint8_t recvPos = 0;
-	_serial.setRxTimeout(0);
+	//_serial.setRxTimeout(0);
     //TODO: should we add timeout here intead of while(1)?
 	while((waitTime =  millis() - startTs) <= READ_TIMEOUT_MS) {
 
-		if(_serial.available() < sizeof(recvBuffer))
+		if(available() < sizeof(recvBuffer))
 			continue;
-		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
+		size_t bytesRead = readBytes(recvBuffer, sizeof(recvBuffer));
 		if(bytesRead < sizeof(recvBuffer)) {
 			Serial.println("Error: read less than available should not happen");
 			continue;
@@ -600,23 +603,23 @@ void RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSi
     flushInput();
     
     // Send command header
-    _serial.write(CMD_SYNC_BYTE);
-    _serial.write(cmd);
+    writeByte(CMD_SYNC_BYTE);
+    writeByte(cmd);
     
     // Send payload if any
     if (payload && payloadSize > 0) {
-        _serial.write(payloadSize);
-        _serial.write(payload, payloadSize);
+        writeByte(payloadSize);
+        writeBytes(payload, payloadSize);
         
         // Calculate and send checksum
         uint8_t checksum = CMD_SYNC_BYTE ^ cmd ^ payloadSize;
         for (uint8_t i = 0; i < payloadSize; i++) {
             checksum ^= payload[i];
         }
-        _serial.write(checksum);
+        writeByte(checksum);
     }
     
-    _serial.flush();
+    //_serial.flush();
 }
 
 bool RPLidar::waitResponseHeader() {
@@ -626,9 +629,9 @@ bool RPLidar::waitResponseHeader() {
     //Serial.println("Waiting for response header...");
     
     // Wait for first sync byte
-    while ((millis() - startTime) < READ_TIMEOUT_MS) {
-        if (_serial.available()) {
-            byte = _serial.read();
+    while ((millis() - startTime) < READ_TIMEOUT_MS*10) {
+        if (available()) {
+            byte = readByte();
             //Serial.printf("Got byte: %02X\n", byte);
             if (byte == RESP_SYNC_BYTE1) {
                 //Serial.println("Found first sync byte");
@@ -636,13 +639,13 @@ bool RPLidar::waitResponseHeader() {
                 // Wait for second sync byte
                 startTime = millis();
                 while ((millis() - startTime) < READ_TIMEOUT_MS) {
-                    if (_serial.available()) {
-                        byte = _serial.read();
+                    if (available()) {
+                        byte = readByte();
                         //Serial.printf("Got second byte: %02X\n", byte);
                         if (byte == RESP_SYNC_BYTE2) {
                             // Read remaining 5 bytes of descriptor
                             uint8_t descriptor[5];
-                            size_t bytesRead = _serial.readBytes(descriptor, 5);
+                            size_t bytesRead = readBytes(descriptor, 5);
                             if (bytesRead != 5) {
                                 Serial.println("Failed to read complete descriptor");
                                 return false;
@@ -697,9 +700,9 @@ bool RPLidar::verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedTyp
 }
 
 void RPLidar::flushInput() {
-    while (_serial.available()) {
-        _serial.read();
-    }
+    //while (_serial.available()) {
+    //    _serial.read();
+    //}
 }
 
 uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {
@@ -708,4 +711,34 @@ uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {
         cs ^= data[i];
     }
     return cs;
+}
+
+// Single byte read
+uint8_t RPLidar::readByte() {
+    uint8_t byte;
+    if(uart_read_bytes(UART_NUM, &byte, 1, pdMS_TO_TICKS(RX_TIMEOUT_MS)) == 1) {
+        return byte;
+    }
+    return 0;
+}
+
+// Read multiple bytes
+size_t RPLidar::readBytes(uint8_t* buffer, size_t length) {
+    return uart_read_bytes(UART_NUM, buffer, length, pdMS_TO_TICKS(RX_TIMEOUT_MS));
+}
+
+// Check available bytes
+size_t RPLidar::available() {
+    size_t available_bytes;
+    uart_get_buffered_data_len(UART_NUM, &available_bytes);
+    return available_bytes;
+}
+
+void RPLidar::writeByte(uint8_t byte) {
+    uart_write_bytes(UART_NUM, &byte, 1);
+}
+
+// Write multiple bytes
+void RPLidar::writeBytes(const uint8_t* data, size_t length) {
+    uart_write_bytes(UART_NUM, (const char*)data, length);
 }

@@ -8,9 +8,17 @@ serialNumber (HEX): 81 53 9D F1 C3 E3 9A C4 C3 E6 98 F9 71 84 34 0D
  */
 #include "RPLidar.h"
 
-RPLidar lidar(Serial2, 16, 17, 5); 
+void setupLidar();
+extern void process_data_task(void *arg);
+extern void uart_rx_task(void *arg);
 
 void setup() {
+  setupLidar();
+}
+
+RPLidar lidar(Serial2, 16, 17, 5); 
+
+void setupLidar() {
     // Start USB serial for debugging and wait for port to be ready
     Serial.begin(115200);
     delay(2000);  // Give time for USB serial to properly initialize
@@ -18,6 +26,7 @@ void setup() {
     delay(500);   // Additional delay to ensure stability
     
     // Initialize RPLidar
+	//Serial2.setRxBufferSize(1024);
     Serial.println("Initializing RPLidar...");
     if (!lidar.begin()) {
         Serial.println("Failed to start RPLidar");
@@ -41,7 +50,10 @@ void setup() {
             Serial.printf("%02X", info.serialnum[i]);
         }
         Serial.println();
-    }
+    } else {
+		Serial.println("Error: Failed to get device info");
+		return;
+	}
 
     // Get health status
     RPLidar::DeviceHealth health;
@@ -57,6 +69,7 @@ void setup() {
         }
     } else {
         Serial.println("Error: Failed to get device health");
+		return;
     }
 
     //Get Scan Rate
@@ -67,6 +80,7 @@ void setup() {
         Serial.printf("  Express Scan Rate: %d usecs\n", scanRate.express);
     } else {
         Serial.println("Error: Failed to get scan rate");
+		return;
     }
 
     // Reset device before starting
@@ -81,6 +95,8 @@ void setup() {
 
     // Start scan
     Serial.println("Starting scan...");
+    xTaskCreate(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL);
+    xTaskCreate(process_data_task, "process", 2048, NULL, 4, NULL);
     //if (!lidar.startScan()) {
     if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
@@ -101,11 +117,7 @@ unsigned long errorCount = 0;
 unsigned long timeoutCount = 0;
 bool firstMeasurement = true;
 
-void loop1() {
-
-}
-
-void loop() {
+void handleLidar() {
   MeasurementData measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN];
     size_t count = 0;
     
@@ -124,27 +136,34 @@ void loop() {
 			rpsCount++;
 			}
 		}		
-		// Print stats every second
-		unsigned long now = millis();
-		if ((now - startMillis) > 10000) {
-			Serial.printf("Errors: %u. Timeouts: %u, Measurements: %u, Measurements per second: %04.0f, rps: %04.0f\n",
-				errorCount, timeoutCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0));
-			Serial.printf("First measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
-							measurements[0].angle, measurements[0].distance, measurements[0].quality);
-			Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
-							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].angle,
-							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].distance,
-							measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].quality);
-			startMillis = millis();
-			measurementCount = 0;
-			rpsCount = 0;
-			errorCount = 0;
-		}
     } 
     else {
         if(ans == SL_RESULT_OPERATION_TIMEOUT)
 			timeoutCount++;
-		else
+		else if(ans == SL_RESULT_INVALID_DATA)
 		 	errorCount++;
     }
+	// Print stats every second
+	unsigned long now = millis();
+	if ((now - startMillis) > 10000) {
+		Serial.printf("Errors: %u. Timeouts: %u, Measurements: %u, Measurements per second: %04.0f, rps: %04.0f bps: %5.0f\n",
+			errorCount, timeoutCount, measurementCount, measurementCount/((now-startMillis)/1000.0), rpsCount/((now-startMillis)/1000.0),
+			measurementCount*132*9/(96*(now-startMillis)/1000.0));
+		Serial.printf("First measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+						measurements[0].angle, measurements[0].distance, measurements[0].quality);
+		Serial.printf("Last measurement - Angle: %.2f°, Distance: %.2fmm, Quality: %d\n", 
+						measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].angle,
+						measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].distance,
+						measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN-1].quality);
+		startMillis = millis();
+		measurementCount = 0;
+		rpsCount = 0;
+		errorCount = 0;
+	}
+}
+
+void loop() {
+    //handleLidar();
+    //Notes: Only delay of 10ms is tolerated. anything more stalls reading lidar.
+    delay(100);
 }

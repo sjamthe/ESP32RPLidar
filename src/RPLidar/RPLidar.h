@@ -1,11 +1,22 @@
-#include <stdint.h>
-// RPLidar.h
+
 #ifndef RPLIDAR_H
 #define RPLIDAR_H
 
+#include <stdint.h>
+#include "driver/uart.h"
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include "util.h"
+#include "freertos/ringbuf.h"
+
+//DMA variables. TODO: replace NUM, TX, RX later
+#define UART_NUM UART_NUM_2
+#define UART_TX_PIN 17
+#define UART_RX_PIN 16
+#define UART_BAUD_RATE 115200
+#define RX_TIMEOUT_MS 1
+#define RING_BUFFER_SIZE 2048
+#define UART_RX_BUF_SIZE 1024
 
 typedef uint32_t sl_result;
 
@@ -14,6 +25,9 @@ typedef uint32_t sl_result;
 #define RPLIDAR_RESP_MEASUREMENT_CHECKBIT       (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT    1
 #define RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT    (0x1<<15)
+ // Express scan payload sync bytes
+#define RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1     0xA
+#define RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2     0x5
 
 typedef struct _sl_lidar_response_measurement_node_t {
     uint8_t sync_quality;      // syncbit:1;syncbit_inverse:1;quality:6;
@@ -87,10 +101,6 @@ public:
     // Response descriptor sync bytes
     static const uint8_t RESP_SYNC_BYTE1 = 0xA5;
     static const uint8_t RESP_SYNC_BYTE2 = 0x5A;
-
-    // Express scan payload sync bytes
-    static const uint8_t RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1 = 0xA;
-    static const uint8_t RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2 = 0x5;
 
     // Measurement quality threshold
     static const uint8_t MIN_QUALITY = 0;
@@ -175,6 +185,11 @@ private:
     sl_result readMeasurementTypeExpLegacy(MeasurementData*, size_t&);
     sl_result _waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_EXP_TIMEOUT_MS);
     void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
+    uint8_t readByte(); 
+    size_t readBytes(uint8_t* buffer, size_t length);
+    size_t available() ;
+    void writeByte(uint8_t byte);
+    void writeBytes(const uint8_t* data, size_t length);
 };
 
 // Definition of the variable bit scale encoding mechanism
