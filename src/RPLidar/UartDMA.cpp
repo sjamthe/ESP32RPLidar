@@ -45,7 +45,7 @@ void uart_rx_task(void *arg) {
         size_t length = 0;
         ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM, &length));
         
-        if(length >= 132) {
+        if(length >= 0) {
             length = uart_read_bytes(UART_NUM, temp_buffer, 
                                    min(length, (size_t) UART_RX_BUF_SIZE), pdMS_TO_TICKS(20));
             if(length > 0) {
@@ -55,7 +55,7 @@ void uart_rx_task(void *arg) {
             }
         }
         unsigned long now = millis();
-	    if ((sends) >= 1000) {
+	    if (total_bytes >= 132000) {
 			Serial.printf("Sends: %d, Bytes read:%d, bps: %5.0f\n",sends, total_bytes, total_bytes*9*1000.0/(now - startMillis));
 			total_bytes = 0;
 			sends = 0;
@@ -66,34 +66,71 @@ void uart_rx_task(void *arg) {
 }
 
 void process_data_task(void *arg) {
-	size_t total_bytes = 0;
-	size_t items = 0;
-    unsigned long startMillis = millis();
-
+    uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];  // Temporary buffer for processing chunks
+    size_t processPos = 0;    // Position in current processing chunk
+    size_t items = 0; // Number of items
+    
     while(1) {
-		if (uart_ring_buf == NULL) {
-            Serial.println("Ring buffer is NULL in process_data_task");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
         size_t item_size;
         uint8_t *item = (uint8_t *)xRingbufferReceive(uart_ring_buf, &item_size, pdMS_TO_TICKS(100));
         
         if(item != NULL) {
-            // Process your data here
-            //handleLidar();
-            // Return item to ring buffer
+            uint32_t startTs = millis();
+            
+            for(size_t i = 0; i < item_size; i++) {
+                uint8_t currentByte = item[i];
+                
+                switch(processPos) {
+                    case 0: {
+                        uint8_t tmp = (currentByte >> 4);
+                        if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1) {
+                            continue;
+                        }
+                        tempBuffer[processPos++] = currentByte;
+                        break;
+                    }
+                    case 1: {
+                        uint8_t tmp = (currentByte >> 4);
+                        if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2) {
+                            processPos = 0;
+                            continue;
+                        }
+                        tempBuffer[processPos++] = currentByte;
+                        break;
+                    }
+                    default:
+                        tempBuffer[processPos++] = currentByte;
+                        
+                        if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
+                            // Process complete packet
+                            sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
+                                (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
+                                
+                            uint8_t checksum = 0;
+                            uint8_t recvChecksum = ((node->s_checksum_1 & 0xF) | (node->s_checksum_2 << 4));
+                            
+                            for(size_t cpos = offsetof(sl_lidar_response_ultra_capsule_measurement_nodes_t, start_angle_sync_q6);
+                                cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos) {
+                                checksum ^= tempBuffer[cpos];
+                            }
+                            
+                            if(recvChecksum == checksum) {
+                                // Valid packet - process it
+                                //process_valid_packet(node);
+                                items++;
+                                if(items >= 1000) {
+                                    Serial.printf("Items: %d\n", items);
+                                    items = 0;
+                                }
+                            }
+                            
+                            processPos = 0;  // Reset for next packet
+                        }
+                        break;
+                }
+            }
+            
             vRingbufferReturnItem(uart_ring_buf, item);
-			items++;
         }
-		total_bytes += item_size;
-        unsigned long now = millis();
-	    if ((items) >= 1000) {
-			Serial.printf("Received: %d, Bytes received:%d, bps: %5.0f\n",items, total_bytes, total_bytes*9*1000.0/(now - startMillis));
-			total_bytes = 0;
-			items = 0;
-			startMillis = now;
-        }
-		vTaskDelay(pdMS_TO_TICKS(1));  // Prevent tight loop
     }
 }

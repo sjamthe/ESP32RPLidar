@@ -15,8 +15,8 @@
 #define UART_RX_PIN 16
 #define UART_BAUD_RATE 115200
 #define RX_TIMEOUT_MS 1
-#define RING_BUFFER_SIZE 2048
-#define UART_RX_BUF_SIZE 1024
+#define RING_BUFFER_SIZE 1024
+#define UART_RX_BUF_SIZE 512
 
 typedef uint32_t sl_result;
 
