@@ -41,6 +41,7 @@ void uart_rx_task(void *arg) {
     size_t total_bytes = 0;
 	size_t sends = 0;
 	size_t fails = 0;
+	size_t min_free_size = RING_BUFFER_SIZE;
     unsigned long startMillis = millis();
 
     while(1) {
@@ -56,16 +57,25 @@ void uart_rx_task(void *arg) {
             length = uart_read_bytes(UART_NUM, temp_buffer, 
                                    min(length, (size_t) UART_RX_BUF_SIZE), pdMS_TO_TICKS(20));
             if(length > 0) {
-                xRingbufferSend(uart_ring_buf, temp_buffer, length, pdMS_TO_TICKS(10));
-				total_bytes += length;
-				sends++;
+                BaseType_t retval = xRingbufferSend(uart_ring_buf, temp_buffer, length, pdMS_TO_TICKS(10));
+				if(retval == pdTRUE) {
+					total_bytes += length;
+					sends++;
+				} else { // ran out of buffer space.
+					fails++; 
+				}
+				size_t free_size = xRingbufferGetCurFreeSize(uart_ring_buf);
+				if(free_size < min_free_size) min_free_size = free_size;
             }
         }
         unsigned long now = millis();
 	    if (total_bytes >= 132000) {
-			Serial.printf("Sends: %d, Bytes read:%d, bps: %5.0f\n",sends, total_bytes, total_bytes*9*1000.0/(now - startMillis));
+
+			Serial.printf("\nSends: %d, Fails: %d,  Bytes read:%d, bps: %5.0f min_free_size: %d\n"
+            ,sends, fails, total_bytes, total_bytes*9*1000.0/(now - startMillis), min_free_size);
 			total_bytes = 0;
 			sends = 0;
+			fails = 0;
 			startMillis = now;
         }
         vTaskDelay(pdMS_TO_TICKS(1));  // Prevent tight loop

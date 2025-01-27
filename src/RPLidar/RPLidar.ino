@@ -19,8 +19,16 @@ typedef struct {
 void process_nodes(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count) {
     //Serial.printf("node_callback for nodes: %d\n",count);
 	Serial.print(".");
-    // Process batch of nodes here. We probably should send a message to another task and freeup this task.
+	// Test buffer overflow scenario 
+	// RING_BUFFER_SIZE 2048
+	// 80ms - min_free_size = 1088
+	// 100ms - min_free_size = 0, 100+ send fails causes problems soon with bps going down.
+	// RING_BUFFER_SIZE 5120
+	// 100ms min_free_size - 15, send fail 60-80 // barely makes it.
+	// RING_BUFFER_SIZE 10240
+	// 100ms min_free_size - 416, send fail 0 // should work.
 
+	vTaskDelay(pdMS_TO_TICKS(100)); 
 }
 
 void setupLidar();
