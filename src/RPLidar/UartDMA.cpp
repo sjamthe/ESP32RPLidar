@@ -75,34 +75,54 @@ void uart_rx_task(void *arg) {
     }
 }
 
+// Queue for communication between processing and publishing tasks
+QueueHandle_t publish_queue;
+
+#define SCANS_PER_PUBLISH 800  // For 10 QPS
+#define MAX_MEASUREMENTS_PER_BATCH 1600  // Reduced size to prevent memory issues
+#define PUBLISH_QUEUE_SIZE 3
+
+struct LaserScanBatch {
+    MeasurementData* measurements;
+    size_t max_measurements;
+    size_t total_measurements;
+    size_t total_rotations;  // Track complete rotations instead of individual scans
+};
+
 void process_data_task(void *arg) {
     task_params_t* params = (task_params_t*)arg;
-    node_callback_t node_callback = params->callback;
     RPLidar *rplidar = params->lidar;
     
-    uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];  // Temporary buffer for processing chunks
-    size_t processPos = 0;    // Position in current processing chunk
-    uint32_t lastProcessTime = millis();
-
-    // Buffer for accumulating nodes
-    //sl_lidar_response_ultra_capsule_measurement_nodes_t nodeBuffer[10];
-    size_t nodeCount = 0;
+    uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];
+    size_t processPos = 0;
     
+    // Create initial batch
+    LaserScanBatch* currentBatch = new LaserScanBatch();
+    if (!currentBatch) {
+        Serial.println("Failed to allocate LaserScanBatch");
+        return;
+    }
+    
+    currentBatch->measurements = (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData));
+    if (!currentBatch->measurements) {
+        Serial.println("Failed to allocate measurements array");
+        delete currentBatch;
+        return;
+    }
+    
+    currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
+    currentBatch->total_measurements = 0;
+    currentBatch->total_rotations = 0;
+
+    Serial.printf("Free heap before loop: %d\n", ESP.getFreeHeap());
+
     while(1) {
         size_t item_size;
-        uint8_t *item = (uint8_t *)xRingbufferReceive(uart_ring_buf, &item_size, pdMS_TO_TICKS(100));
-        
-        /* //Check timeout
-        uint32_t currentTime = millis();
-        if (currentTime - lastProcessTime >= 100 && nodeCount > 0) {
-            node_callback(nodeBuffer, nodeCount);
-            nodeCount = 0;
-            lastProcessTime = currentTime;
-        }  */
+        //Read buffer comnig from Uart task.
+        uint8_t *item = (uint8_t *)xRingbufferReceive(uart_ring_buf, &item_size, pdMS_TO_TICKS(10));
 
         if(item != NULL) {
-            uint32_t startTs = millis();
-            
+            // parse every byte of the buffer looking for the beginning of the node package 
             for(size_t i = 0; i < item_size; i++) {
                 uint8_t currentByte = item[i];
                 
@@ -127,8 +147,8 @@ void process_data_task(void *arg) {
                     default:
                         tempBuffer[processPos++] = currentByte;
                         
+                        // If we got a complete node (132 bytes) verify checksum.
                         if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
-                            // Process complete packet
                             sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
                                 (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
                                 
@@ -139,72 +159,126 @@ void process_data_task(void *arg) {
                                 cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos) {
                                 checksum ^= tempBuffer[cpos];
                             }
-
-                            // Process node if checksum is correct
-                            MeasurementData measurements[rplidar->EXPRESS_MEASUREMENTS_PER_SCAN];
-                            size_t count = 0;
-
+                            processPos = 0;
+                            //if checksum is ok extract measurementdata (96 measurements) from this node.
                             if(recvChecksum == checksum) {
+                                    MeasurementData measurements[rplidar->EXPRESS_MEASUREMENTS_PER_SCAN];
+                                size_t count = 0;
                                 rplidar->ultraCapsuleToNormal(*node, measurements, count);
-                                node_callback(measurements, count);
+                                
+                                for(size_t i = 0; i < count; i++) {
+                                    // First, add the measurement. not sure what currentBatch->max_measurements is for 
+                                    if(currentBatch->total_measurements < currentBatch->max_measurements) {
+                                        currentBatch->measurements[currentBatch->total_measurements++] = measurements[i];
+                                    }
+                                    
+                                    // Then check if it's a start flag
+                                    if(measurements[i].startFlag) {
+                                        currentBatch->total_rotations++;
+                                    }
+                                        
+                                    // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
+                                    //if(currentBatch->total_rotations >= 12) {
+                                    if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
+                                        // Queue the batch
+                                        if(xQueueSend(publish_queue, &currentBatch, 0) != pdTRUE) {
+                                            // Queue full, clean up
+                                            free(currentBatch->measurements);
+                                            delete currentBatch;
+                                            Serial.println("Queue full, batch dropped");
+                                        }
+                                        
+                                        // Create new batch
+                                        currentBatch = new LaserScanBatch();
+                                        if (!currentBatch) {
+                                            Serial.println("Failed to allocate new batch");
+                                            continue;
+                                        }
+                                        
+                                        currentBatch->measurements = (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData));
+                                        if (!currentBatch->measurements) {
+                                            Serial.println("Failed to allocate measurements array");
+                                            delete currentBatch;
+                                            continue;
+                                        }
+                                        
+                                        currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
+                                        currentBatch->total_measurements = 0;
+                                        currentBatch->total_rotations = 0;
+                                    }
+
+                                }
                             }
-                                                        
-                            processPos = 0;  // Reset for next packet
-                        }
+						}
                         break;
                 }
             }
-            
             vRingbufferReturnItem(uart_ring_buf, item);
+        }
+        /* Periodically print heap info
+        static uint32_t last_heap_check = 0;
+        if (millis() - last_heap_check > 5000) {
+            Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
+            Serial.printf("Current batch - measurements: %d, rotations: %d\n", 
+                currentBatch->total_measurements, 
+                currentBatch->total_rotations);
+            last_heap_check = millis();
+       }*/
+    }
+}
+
+// Modified publish task
+void publish_task(void *arg) {
+    static unsigned long total_measurements = 0;
+    static unsigned long total_rotations = 0;
+    static unsigned long total_messages = 0;
+    unsigned long start_ms = 0;
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    while(1) {
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        
+        LaserScanBatch* batch_to_publish;
+        if(xQueueReceive(publish_queue, &batch_to_publish, 0) == pdTRUE) {
+            // Process the batch
+            // Future: ROS2 publishing code here
+            
+            if(!start_ms) start_ms = millis();
+            total_measurements += batch_to_publish->total_measurements;
+            total_rotations += batch_to_publish->total_rotations;
+            total_messages++;
+            
+            if((millis() - start_ms) >= 10000) {
+                Serial.printf("Published: %d, Rotations: %d, Measurements: %d, Rate: %.1f measurements/s\n",
+                    total_messages,
+                    total_rotations,
+                    total_measurements,
+                    1000.0 * total_measurements / (millis() - start_ms));
+                total_measurements = 0;
+                total_rotations = 0;
+                total_messages = 0;
+                start_ms = millis();
+            }
+            
+            // Clean up
+            free(batch_to_publish->measurements);
+            delete batch_to_publish;
         }
     }
 }
 
-static unsigned long scans = 0;
-unsigned long start_ms = 0;
-
-void process_nodes(MeasurementData* measurements, size_t count) {
-    //Serial.printf("node_callback for nodes: %d\n",count);
-	for(int i=0; i<count; i++) {
-		if(measurements[i].startFlag) {
-			//Serial.print(".");
-			// publish message here.
-			vTaskDelay(pdMS_TO_TICKS(100));
-
-		}
-	}
-	if(!start_ms) start_ms = millis();
-	scans += count;
-	if((millis() - start_ms) >= 10000) {
-		Serial.printf(" Scans published:%5.0f\n", 1000.0*scans/(millis() - start_ms));
-		scans = 0;
-		start_ms = millis();
-	}
-
-	// Test buffer overflow scenario 
-	// RING_BUFFER_SIZE 2048
-	// 80ms - min_free_size = 1088
-	// 100ms - min_free_size = 0, 100+ send fails causes problems soon with bps going down.
-	// RING_BUFFER_SIZE 5120
-	// 100ms min_free_size - 15, send fail 60-80 // barely makes it.
-	// RING_BUFFER_SIZE 10240
-	// 80ms min_free_size = 8496 fails 0 
-	// 90ms min_free_size = 16 fails 90 
-	// 100ms min_free_size = 416, send fail 0 // should work.
-
-}
-
+// Modified setup function
 void setupUartTasks(RPLidar* lidar) {
-    //xTaskCreate(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL);
-	xTaskCreatePinnedToCore(
-		uart_rx_task,          // Task function
-		"uart_rx",            // Name of task
-		2048,                 // Stack size
-		NULL,                 // Task input parameter
-		5,                    // Priority
-		NULL,                 // Task handle
-		1                     // Core where the task should run (1)
-	);
+    // Create the publish queue
+    publish_queue = xQueueCreate(PUBLISH_QUEUE_SIZE, sizeof(LaserScanBatch*));
+    if(publish_queue == NULL) {
+        Serial.println("Failed to create publish queue");
+        return;
+    }
+
+    // Create tasks on Core 1
+    xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL, 1);
 
     task_params_t* params = (task_params_t*)malloc(sizeof(task_params_t));
     if(params == NULL) {
@@ -212,15 +286,8 @@ void setupUartTasks(RPLidar* lidar) {
         return;
     }
     params->lidar = lidar;
-    params->callback = process_nodes;
-    //xTaskCreate(process_data_task, "process_data", 8192, (void*)params, 4, NULL);
-	xTaskCreatePinnedToCore(
-		process_data_task,     // Task function
-		"process_data",       // Name of task
-		8192,                 // Stack size
-		(void*)params,        // Task input parameter
-		5,                    // Same priority as UART task since we want fair scheduling
-		NULL,                 // Task handle
-		1                     // Core where the task should run (1)
-	);
+    // callback assignment removed
+    
+    xTaskCreatePinnedToCore(process_data_task, "process_data", 8192, (void*)params, 5, NULL, 1);
+    xTaskCreatePinnedToCore(publish_task, "publish", 4096, NULL, 4, NULL, 1);
 }

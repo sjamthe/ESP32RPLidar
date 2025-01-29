@@ -23,7 +23,7 @@ struct MeasurementData {
 #define UART_RX_PIN 16
 #define UART_BAUD_RATE 115200
 #define RX_TIMEOUT_MS 1
-#define RING_BUFFER_SIZE (4*1024)
+#define RING_BUFFER_SIZE (1*1024)
 #define UART_RX_BUF_SIZE 256
 
 typedef uint32_t sl_result;
@@ -228,12 +228,12 @@ private:
 
 typedef void (*node_callback_t)(MeasurementData* , size_t );
 
-typedef struct {
-	RPLidar *lidar;
-    node_callback_t callback;
-    // Add other parameters if needed
-} task_params_t;
+// Update the task params struct to remove callback
+struct task_params_t {
+    RPLidar *lidar;
+    // callback removed since we're using queue now
+};
 
-void process_nodes(MeasurementData* measurements, size_t count);
+//void process_nodes(MeasurementData* measurements, size_t count);
 
 #endif // RPLIDAR_H
