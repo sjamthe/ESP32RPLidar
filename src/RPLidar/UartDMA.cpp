@@ -178,8 +178,8 @@ void process_data_task(void *arg) {
                                     }
                                         
                                     // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
-                                    //if(currentBatch->total_rotations >= 12) {
-                                    if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
+                                    if(currentBatch->total_rotations >= 1) {
+                                    //if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
                                         // Queue the batch
                                         if(xQueueSend(publish_queue, &currentBatch, 0) != pdTRUE) {
                                             // Queue full, clean up
@@ -233,11 +233,11 @@ void publish_task(void *arg) {
     static unsigned long total_rotations = 0;
     static unsigned long total_messages = 0;
     unsigned long start_ms = 0;
-    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+    const TickType_t xFrequency = pdMS_TO_TICKS(60);
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     while(1) {
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
         
         LaserScanBatch* batch_to_publish;
         if(xQueueReceive(publish_queue, &batch_to_publish, 0) == pdTRUE) {
@@ -249,12 +249,15 @@ void publish_task(void *arg) {
             total_rotations += batch_to_publish->total_rotations;
             total_messages++;
             
-            if((millis() - start_ms) >= 10000) {
-                Serial.printf("Published: %d, Rotations: %d, Measurements: %d, Rate: %.1f measurements/s\n",
+            //if((millis() - start_ms) >= 10000) {
+            if(total_messages >= 120) {
+                Serial.printf("Published: %d, pubs (ms): %.0f, mes/rot: %.1f, Measurements: %d, Rate: %.0f measurements/s\n",
                     total_messages,
-                    total_rotations,
+                    1.0*(millis() - start_ms)/total_messages,
+                    1.0*total_measurements/total_rotations,
                     total_measurements,
                     1000.0 * total_measurements / (millis() - start_ms));
+
                 total_measurements = 0;
                 total_rotations = 0;
                 total_messages = 0;
