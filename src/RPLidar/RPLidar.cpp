@@ -383,7 +383,7 @@ sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measur
     return SL_RESULT_OPERATION_TIMEOUT ;
 }
 
-void RPLidar::_ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount)
+void RPLidar::ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount)
     {
     nodeCount = 0;
     if (_is_previous_capsuledataRdy) {
@@ -501,7 +501,7 @@ sl_result RPLidar::readMeasurementTypeExpExtended(MeasurementData* measurements,
     if (ans != SL_RESULT_OK) {
         return ans;
     }
-    _ultraCapsuleToNormal(node, measurements, count);
+    ultraCapsuleToNormal(node, measurements, count);
 	return SL_RESULT_OK;
 }
 

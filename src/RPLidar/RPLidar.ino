@@ -8,32 +8,11 @@ serialNumber (HEX): 81 53 9D F1 C3 E3 9A C4 C3 E6 98 F9 71 84 34 0D
  */
 #include "RPLidar.h"
 
-typedef void (*node_callback_t)(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count);
-// Task parameters structure
-typedef struct {
-    node_callback_t callback;
-    // Add other parameters if needed
-} task_params_t;
-
-// Example callback implementation
-void process_nodes(sl_lidar_response_ultra_capsule_measurement_nodes_t* nodes, size_t count) {
-    //Serial.printf("node_callback for nodes: %d\n",count);
-	Serial.print(".");
-	// Test buffer overflow scenario 
-	// RING_BUFFER_SIZE 2048
-	// 80ms - min_free_size = 1088
-	// 100ms - min_free_size = 0, 100+ send fails causes problems soon with bps going down.
-	// RING_BUFFER_SIZE 5120
-	// 100ms min_free_size - 15, send fail 60-80 // barely makes it.
-	// RING_BUFFER_SIZE 10240
-	// 100ms min_free_size - 416, send fail 0 // should work.
-
-	vTaskDelay(pdMS_TO_TICKS(100)); 
-}
 
 void setupLidar();
 extern void process_data_task(void *arg);
 extern void uart_rx_task(void *arg);
+extern void setupUartTasks(RPLidar* lidar);
 
 void setup() {
   setupLidar();
@@ -75,6 +54,8 @@ void setupLidar() {
         Serial.println();
     } else {
 		Serial.println("Error: Failed to get device info");
+		delay(10000); 
+		ESP.restart();
 		return;
 	}
 
@@ -86,12 +67,14 @@ void setupLidar() {
         Serial.printf("  Error Code: 0x%04X\n", health.error_code);
         if (health.status == 2) {  // Error state
             Serial.println("Device is in error state!");
-            delay(1000);  // Give time for error message to be sent
-            //ESP.restart(); // Restart on error
+            delay(10000);  // Give time for error message to be sent
+            ESP.restart(); // Restart on error
             return;
         }
     } else {
         Serial.println("Error: Failed to get device health");
+		delay(10000); 
+		ESP.restart(); // Restart on error
 		return;
     }
 
@@ -103,6 +86,8 @@ void setupLidar() {
         Serial.printf("  Express Scan Rate: %d usecs\n", scanRate.express);
     } else {
         Serial.println("Error: Failed to get scan rate");
+		delay(10000); 
+		ESP.restart(); // Restart on error
 		return;
     }
 
@@ -117,7 +102,10 @@ void setupLidar() {
     delay(1000);  // Give motor time to reach speed
 
     // Start scan
+    
     Serial.println("Starting scan...");
+    setupUartTasks(&lidar);
+   /*
     xTaskCreate(uart_rx_task, "uart_rx", 2048, NULL, 5, NULL);
 
     task_params_t* params = (task_params_t*)malloc(sizeof(task_params_t));
@@ -125,8 +113,10 @@ void setupLidar() {
 		Serial.println("Error: params is NULL");
 		return;
 	}
+	params->lidar = &lidar;
     params->callback = process_nodes;
     xTaskCreate(process_data_task, "process_data", 8192, (void*)params, 4, NULL);
+    */
 
     if (!lidar.startExpressScan()) {
         Serial.println("Failed to start scan");
@@ -139,7 +129,7 @@ void setupLidar() {
     // Wait for measurements to start
     delay(200);
 }
-
+/*
 unsigned long startMillis = 0;
 unsigned long measurementCount = 0;
 unsigned long rpsCount = 0;
@@ -149,7 +139,7 @@ bool firstMeasurement = true;
 
 void handleLidar() {
   MeasurementData measurements[lidar.EXPRESS_MEASUREMENTS_PER_SCAN];
-    size_t count = 0;
+  size_t count = 0;
     
 	sl_result ans = lidar.readMeasurement(measurements, count);
     if (ans == SL_RESULT_OK) {
@@ -191,7 +181,7 @@ void handleLidar() {
 		errorCount = 0;
 	}
 }
-
+*/
 void loop() {
     //handleLidar();
     //Notes: Only delay of 10ms is tolerated. anything more stalls reading lidar.

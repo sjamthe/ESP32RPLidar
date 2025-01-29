@@ -9,14 +9,22 @@
 #include "util.h"
 #include "freertos/ringbuf.h"
 
+// Structure for scan measurement data
+struct MeasurementData {
+	float angle;        // In degrees
+	float distance;     // In millimeters
+	uint8_t quality;    // Quality of measurement
+	bool startFlag;     // Start flag for new scan
+};
+
 //DMA variables. TODO: replace NUM, TX, RX later
 #define UART_NUM UART_NUM_2
 #define UART_TX_PIN 17
 #define UART_RX_PIN 16
 #define UART_BAUD_RATE 115200
 #define RX_TIMEOUT_MS 1
-#define RING_BUFFER_SIZE 10240
-#define UART_RX_BUF_SIZE 512
+#define RING_BUFFER_SIZE (4*1024)
+#define UART_RX_BUF_SIZE 256
 
 typedef uint32_t sl_result;
 
@@ -57,14 +65,6 @@ typedef struct _sl_lidar_response_ultra_capsule_measurement_nodes_t
     uint16_t                            start_angle_sync_q6;
     sl_lidar_response_ultra_cabin_nodes_t  ultra_cabins[32];
 } __attribute__((packed)) sl_lidar_response_ultra_capsule_measurement_nodes_t;
-
-// Structure for scan measurement data
-struct MeasurementData {
-	float angle;        // In degrees
-	float distance;     // In millimeters
-	uint8_t quality;    // Quality of measurement
-	bool startFlag;     // Start flag for new scan
-};
 
 class RPLidar {
 public:
@@ -156,6 +156,8 @@ public:
     // Data retrieval
     // Declare a function pointer for commin name.
     sl_result readMeasurement(MeasurementData*, size_t&);
+    void ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
+
     
     // Motor control
     void startMotor(uint8_t pwm = 255);
@@ -184,7 +186,6 @@ private:
     sl_result readMeasurementTypeExpExtended(MeasurementData*, size_t&);
     sl_result readMeasurementTypeExpLegacy(MeasurementData*, size_t&);
     sl_result _waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_EXP_TIMEOUT_MS);
-    void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
     uint8_t readByte(); 
     size_t readBytes(uint8_t* buffer, size_t length);
     size_t available() ;
@@ -224,5 +225,15 @@ private:
 
 #define SL_IS_OK(x)    ( ((x) & SL_RESULT_FAIL_BIT) == 0 )
 #define SL_IS_FAIL(x)  ( ((x) & SL_RESULT_FAIL_BIT) )
+
+typedef void (*node_callback_t)(MeasurementData* , size_t );
+
+typedef struct {
+	RPLidar *lidar;
+    node_callback_t callback;
+    // Add other parameters if needed
+} task_params_t;
+
+void process_nodes(MeasurementData* measurements, size_t count);
 
 #endif // RPLIDAR_H
