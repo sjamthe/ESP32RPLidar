@@ -26,6 +26,19 @@ struct MeasurementData {
 #define RING_BUFFER_SIZE (1*1024)
 #define UART_RX_BUF_SIZE 256
 
+// Queue configuration
+#define SCANS_PER_PUBLISH 800  // For 10 QPS
+#define MAX_MEASUREMENTS_PER_BATCH 1600
+#define PUBLISH_QUEUE_SIZE 3
+
+// LaserScan batch structure
+struct LaserScanBatch {
+    MeasurementData* measurements;
+    size_t max_measurements;
+    size_t total_measurements;
+    size_t total_rotations;
+};
+
 typedef uint32_t sl_result;
 
 #define RPLIDAR_RESP_MEASUREMENT_SYNCBIT        (0x1<<0)
@@ -136,6 +149,7 @@ public:
 
     // Constructor
     RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin = -1);
+    ~RPLidar();
 
     // Basic operations
     bool begin(unsigned long baud = 115200);
@@ -163,6 +177,13 @@ public:
     void startMotor(uint8_t pwm = 255);
     void stopMotor();
 
+    // New DMA-related methods
+    void setupUartDMA();
+    void setupUartTasks();
+    static void uartRxTask(void* arg);
+    static void processDataTask(void* arg);
+    static void publishTask(void* arg);
+
 private:
     HardwareSerial& _serial;
     int _rxPin;
@@ -175,7 +196,13 @@ private:
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
     bool _is_previous_capsuledataRdy;
     sl_lidar_response_ultra_capsule_measurement_nodes_t _cached_previous_ultracapsuledata;
-
+    
+    // New DMA-related members
+    RingbufHandle_t _uartRingBuf;
+    QueueHandle_t _publishQueue;
+    TaskHandle_t _uartTaskHandle;
+    TaskHandle_t _processTaskHandle;
+    TaskHandle_t _publishTaskHandle;
     // Helper functions
     bool waitResponseHeader();
     void flushInput();
