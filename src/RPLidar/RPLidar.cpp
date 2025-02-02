@@ -5,14 +5,13 @@
 #include <sys/_stdint.h>
 #include "RPLidar.h"
 
-static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel)
-		{
-	static const uint32_t VBS_SCALED_BASE[] = {
-	SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X8_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X4_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X2_DEST_VAL,
-			0,
+static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel) {
+        static const uint32_t VBS_SCALED_BASE[] = {
+        SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X8_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X4_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X2_DEST_VAL,
+		0,
 	};
 
 	static const uint32_t VBS_SCALED_LVL[] = {
@@ -60,42 +59,407 @@ static void convert(const sl_lidar_response_measurement_node_hq_t &from, Measure
 RPLidar::RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin)
     : _serial(serial), _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
 }
+void RPLidar::setupUartDMA() {
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    esp_err_t err;
+    
+    // First delete any existing UART driver
+    uart_driver_delete(UART_NUM);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Give some time for cleanup
+    
+    err = uart_param_config(UART_NUM, &uart_config);
+    if (err != ESP_OK) {
+        Serial.printf("Failed to configure UART parameters: %d\n", err);
+        return;
+    }
+
+    err = uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        Serial.printf("Failed to set UART pins: %d\n", err);
+        return;
+    }
+
+    err = uart_driver_install(UART_NUM, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        Serial.printf("Failed to install UART driver: %d\n", err);
+        return;
+    }
+
+    Serial.println("UART DMA setup completed successfully");
+}
+
+void RPLidar::stopUartTasks() {
+    // Clean up tasks
+    if (_uartTaskHandle!= NULL) {
+        vTaskDelete(_uartTaskHandle);
+        _uartTaskHandle = NULL;
+    }
+    if (_processTaskHandle!= NULL) {
+        vTaskDelete(_processTaskHandle);
+        _processTaskHandle = NULL;
+    }
+    if (_publishTaskHandle!= NULL) {
+        vTaskDelete(_publishTaskHandle);
+        _publishTaskHandle = NULL;
+    }
+
+    // Clean up ring buffer and queue
+    if (_uartRingBuf) {
+        vRingbufferDelete(_uartRingBuf);
+        _uartRingBuf = NULL;
+    }
+    if (_publishQueue) {
+        vQueueDelete(_publishQueue);
+        _publishQueue = NULL;
+    }
+}
+
+void RPLidar::setupUartTasks() {
+    // Create ring buffer if not already created
+    if (_uartRingBuf == NULL) {
+        _uartRingBuf = xRingbufferCreate(RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+        if (_uartRingBuf == NULL) {
+            Serial.println("Failed to create ring buffer");
+            return;
+        }
+        Serial.println("Ring buffer created successfully");
+    }
+    
+    // Create publish queue if not already created
+    if (_publishQueue == NULL) {
+        _publishQueue = xQueueCreate(PUBLISH_QUEUE_SIZE, sizeof(LaserScanBatch*));
+        if (_publishQueue == NULL) {
+            Serial.println("Failed to create publish queue");
+            return;
+        }
+        Serial.println("Publish queue created successfully");
+    }
+
+    // Create tasks if they don't exist
+    if (_uartTaskHandle == NULL) {
+        BaseType_t result = xTaskCreatePinnedToCore(
+            uartRxTask,
+            "uart_rx",
+            4096,  // Increased stack size
+            this,
+            5,
+            &_uartTaskHandle,
+            1
+        );
+        if (result != pdPASS) {
+            Serial.println("Failed to create uart_rx task");
+            return;
+        }
+        Serial.println("UART RX task created successfully");
+    }
+
+    if (_processTaskHandle == NULL) {
+        BaseType_t result = xTaskCreatePinnedToCore(
+            processDataTask,
+            "process_data",
+            16384,  // Increased stack size
+            this,
+            5,
+            &_processTaskHandle,
+            1
+        );
+        if (result != pdPASS) {
+            Serial.println("Failed to create process_data task");
+            return;
+        }
+        Serial.println("Process data task created successfully");
+    }
+
+    if (_publishTaskHandle == NULL) {
+        BaseType_t result = xTaskCreatePinnedToCore(
+            publishTask,
+            "publish",
+            8192,  // Increased stack size
+            this,
+            4,
+            &_publishTaskHandle,
+            1
+        );
+        if (result != pdPASS) {
+            Serial.println("Failed to create publish task");
+            return;
+        }
+        Serial.println("Publish task created successfully");
+    }
+    
+    // Give tasks time to initialize
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+void RPLidar::uartRxTask(void* arg) {
+    RPLidar* lidar = static_cast<RPLidar*>(arg);
+    uint8_t tempBuffer[UART_RX_BUF_SIZE];
+    size_t readBytes = 0;
+    size_t sends = 0;
+    size_t lostBytes = 0;
+    size_t minFreeSize = RING_BUFFER_SIZE;
+    unsigned long startMillis = millis();
+
+    while(1) {
+        size_t length = 0;
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM, &length));
+        
+        if(length > 0) {
+            length = uart_read_bytes(UART_NUM, tempBuffer, 
+                                   min(length, (size_t)UART_RX_BUF_SIZE), 
+                                   pdMS_TO_TICKS(20));
+            if(length > 0) {
+                BaseType_t retval = xRingbufferSend(lidar->_uartRingBuf, 
+                                                   tempBuffer, length, 
+                                                   pdMS_TO_TICKS(10));
+                if(retval == pdTRUE) {
+                    readBytes += length;
+                    sends++;
+                } else {
+                    lostBytes += length;
+                }
+                size_t freeSize = xRingbufferGetCurFreeSize(lidar->_uartRingBuf);
+                if(freeSize < minFreeSize) minFreeSize = freeSize;
+            }
+        }
+
+        // Print statistics periodically
+        unsigned long now = millis();
+        if ((readBytes + lostBytes) >= 132000) {
+            Serial.printf("\nSends: %d, Bytes read:%d, lost:%d, bps: %5.0f min_free_size: %d\n",
+                sends, readBytes, lostBytes, 
+                readBytes*9*1000.0/(now - startMillis), minFreeSize);
+            readBytes = 0;
+            sends = 0;
+            lostBytes = 0;
+            startMillis = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+void RPLidar::processDataTask(void* arg) {
+    RPLidar* lidar = static_cast<RPLidar*>(arg);
+    uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];
+    size_t processPos = 0;
+    
+    LaserScanBatch* currentBatch = new LaserScanBatch();
+    if (!currentBatch || !(currentBatch->measurements = 
+        (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData)))) {
+        Serial.println("Failed to allocate batch resources");
+        delete currentBatch;
+        return;
+    }
+    
+    currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
+    currentBatch->total_measurements = 0;
+    currentBatch->total_rotations = 0;
+
+    while(1) {
+        size_t itemSize;
+        uint8_t* item = (uint8_t*)xRingbufferReceive(lidar->_uartRingBuf, &itemSize, pdMS_TO_TICKS(10));
+
+        if(item != NULL) {
+            // parse every byte of the buffer looking for the beginning of the node package 
+            for(size_t i = 0; i < itemSize; i++) {
+                uint8_t currentByte = item[i];
+                
+                switch(processPos) {
+                    case 0: {
+                        uint8_t tmp = (currentByte >> 4);
+                        if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1) {
+                            continue;
+                        }
+                        tempBuffer[processPos++] = currentByte;
+                        break;
+                    }
+                    case 1: {
+                        uint8_t tmp = (currentByte >> 4);
+                        if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2) {
+                            processPos = 0;
+                            continue;
+                        }
+                        tempBuffer[processPos++] = currentByte;
+                        break;
+                    }
+                    default:
+                        tempBuffer[processPos++] = currentByte;
+                        
+                        // If we got a complete node (132 bytes) verify checksum.
+                        if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
+                            sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
+                                (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
+                                
+                            uint8_t checksum = 0;
+                            uint8_t recvChecksum = ((node->s_checksum_1 & 0xF) | (node->s_checksum_2 << 4));
+                            
+                            for(size_t cpos = offsetof(sl_lidar_response_ultra_capsule_measurement_nodes_t, start_angle_sync_q6);
+                                cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos) {
+                                checksum ^= tempBuffer[cpos];
+                            }
+                            processPos = 0;
+                            //if checksum is ok extract measurementdata (96 measurements) from this node.
+                            if(recvChecksum == checksum) {
+                                    MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
+                                size_t count = 0;
+                                lidar->ultraCapsuleToNormal(*node, measurements, count);
+                                
+                                for(size_t i = 0; i < count; i++) {
+                                    // First, add the measurement. not sure what currentBatch->max_measurements is for 
+                                    if(currentBatch->total_measurements < currentBatch->max_measurements) {
+                                        currentBatch->measurements[currentBatch->total_measurements++] = measurements[i];
+                                    }
+                                    
+                                    // Then check if it's a start flag
+                                    if(measurements[i].startFlag) {
+                                        currentBatch->total_rotations++;
+                                    }
+                                        
+                                    // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
+                                    if(currentBatch->total_rotations >= 1) {
+                                    //if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
+                                        // Queue the batch
+                                        if(xQueueSend(lidar->_publishQueue, &currentBatch, 0) != pdTRUE) {
+                                            // Queue full, clean up
+                                            free(currentBatch->measurements);
+                                            delete currentBatch;
+                                            Serial.println("Queue full, batch dropped");
+                                        }
+                                        
+                                        // Create new batch
+                                        currentBatch = new LaserScanBatch();
+                                        if (!currentBatch) {
+                                            Serial.println("Failed to allocate new batch");
+                                            continue;
+                                        }
+                                        
+                                        currentBatch->measurements = (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData));
+                                        if (!currentBatch->measurements) {
+                                            Serial.println("Failed to allocate measurements array");
+                                            delete currentBatch;
+                                            continue;
+                                        }
+                                        
+                                        currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
+                                        currentBatch->total_measurements = 0;
+                                        currentBatch->total_rotations = 0;
+                                    }
+
+                                }
+                            }
+						}
+                        break;
+                }
+            }
+            vRingbufferReturnItem(lidar->_uartRingBuf, item);
+        }
+    }
+}
+
+void RPLidar::publishTask(void* arg) {
+    RPLidar* lidar = static_cast<RPLidar*>(arg);
+    static unsigned long totalMeasurements = 0;
+    static unsigned long totalRotations = 0;
+    static unsigned long totalMessages = 0;
+    unsigned long startMs = 0;
+    unsigned long delayMs = 0;
+    const TickType_t xFrequency = pdMS_TO_TICKS(80);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    BaseType_t xWasDelayed;
+
+    startMs = millis();
+    while(1) {
+        LaserScanBatch* batchToPublish;
+        if(xQueueReceive(lidar->_publishQueue, &batchToPublish, 0) == pdTRUE) {
+            //test some delays
+            xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+            delayMs += xWasDelayed;
+
+            totalMeasurements += batchToPublish->total_measurements;
+            totalRotations += batchToPublish->total_rotations;
+            totalMessages++;
+            
+            if(totalMessages >= 120) {
+                Serial.printf("Published: %d, pubs (ms): %.0f, mes/rot: %.1f, "
+                            "Measurements: %d, Rate: %.0f measurements/s,"
+                            "Free queue space: %d, Delays(ms): %d\n",
+                    totalMessages,
+                    1.0*(millis() - startMs)/totalMessages,
+                    1.0*totalMeasurements/totalRotations,
+                    totalMeasurements,
+                    1000.0 * totalMeasurements / (millis() - startMs),
+                    uxQueueSpacesAvailable(lidar->_publishQueue),
+                    delayMs);
+
+                totalMeasurements = 0;
+                totalRotations = 0;
+                totalMessages = 0;
+                delayMs = 0;
+                startMs = millis();
+            }
+            
+            free(batchToPublish->measurements);
+            delete batchToPublish;
+        }
+    }
+}
 
 bool RPLidar::begin(unsigned long baud) {
-    // End any previous serial connection
-    _serial.end();
-    delay(100);  // Give time for serial to fully close
-    
-    // Initialize serial
-    _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
-    delay(500);  // Give time for serial to initialize
+    setupUartDMA();
+    delay(1000);  // Give time for initialization
     _isConnected = true;
     
-    // Setup motor pin if provided
     if (_motorPin >= 0) {
         pinMode(_motorPin, OUTPUT);
         analogWrite(_motorPin, 0);
     }
     
-    // Clear any stale data
-    flushInput();
+    // Initialize task handles to NULL
+    _uartTaskHandle = NULL;
+    _processTaskHandle = NULL;
+    _publishTaskHandle = NULL;
+    _uartRingBuf = NULL;
+    _publishQueue = NULL;
     
+    flushInput();
     return true;
+}
+
+RPLidar::~RPLidar() {
+    // Clean up tasks
+    if (_uartTaskHandle) vTaskDelete(_uartTaskHandle);
+    if (_processTaskHandle) vTaskDelete(_processTaskHandle);
+    if (_publishTaskHandle) vTaskDelete(_publishTaskHandle);
+    
+    // Clean up ring buffer and queue
+    if (_uartRingBuf) vRingbufferDelete(_uartRingBuf);
+    if (_publishQueue) vQueueDelete(_publishQueue);
+    
+    // Clean up UART
+    uart_driver_delete(UART_NUM);
 }
 
 void RPLidar::end() {
     stopMotor();
-    _serial.end();
     _isConnected = false;
 }
 
-bool RPLidar::stop() {
+bool RPLidar::stopScan() {
     sendCommand(CMD_STOP);
     delay(1); // Per protocol spec, give 1ms gap before other command.
+    stopUartTasks();
+    stopMotor();
     return true;
 }
 
-bool RPLidar::reset() {
+bool RPLidar::resetLidar() {
     sendCommand(CMD_RESET); // reboot lidar microcontroller
     delay(2); // Per protocol spec, give 2ms gap before other command.
     return true;
@@ -105,7 +469,7 @@ bool RPLidar::startScan() {
     if(!_isConnected) return false; // Don't start scan if not connected.
 
     // Stop any previous operation
-    stop();
+    stopScan();
     delay(1);
     
     // Send scan command
@@ -128,8 +492,15 @@ bool RPLidar::startScan() {
 bool RPLidar::startExpressScan(uint8_t expressScanType) {
     if(!_isConnected) return false; // Don't start scan if not connected.
 
-    stop();
-    delay(1);
+    sendCommand(CMD_STOP);
+    delay(1); // Per protocol spec, give 1ms gap before other command.
+
+    setupUartTasks();
+    //wait a little for tasks to spawn.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Enable motor
+    if(!_motorEnabled) startMotor();
 
     // Express scan command,payload,checksum expected.
     // legacy   82 5 0 0 0 0 22
@@ -146,6 +517,7 @@ bool RPLidar::startExpressScan(uint8_t expressScanType) {
     if (!waitResponseHeader()) {
         return false;
     }
+
 	// Verify response descriptor
   if(expressScanType == EXPRESS_TYPE_LEGACY) {
     if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_LEGACY_SCAN, 84)) {
@@ -197,7 +569,7 @@ bool RPLidar::getHealth(DeviceHealth& health) {
     
     // Read data according to length from descriptor
     uint8_t buffer[3];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -228,7 +600,7 @@ bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
     
     // Read data according to length from descriptor
     uint8_t buffer[expectedLength];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -259,7 +631,7 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     
     // Read data according to length from descriptor
     uint8_t buffer[20];
-    size_t bytesRead = _serial.readBytes(buffer, _responseDescriptor.length);
+    size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
         Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
@@ -313,10 +685,10 @@ sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measur
 
     while ((waitTime = millis() - startTs) <= timeout) {
 
-        if(_serial.available() < recvSize)
+        if(available() < recvSize)
 			continue;
 
-		size_t bytesRead = _serial.readBytes(recvBuffer, recvSize);
+		size_t bytesRead = readBytes(recvBuffer, recvSize);
 		if(bytesRead < recvSize) {
 			Serial.println("Error: read less than available should not happen");
 			continue;
@@ -380,7 +752,7 @@ sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measur
     return SL_RESULT_OPERATION_TIMEOUT ;
 }
 
-void RPLidar::_ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount)
+void RPLidar::ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount)
     {
     nodeCount = 0;
     if (_is_previous_capsuledataRdy) {
@@ -498,7 +870,7 @@ sl_result RPLidar::readMeasurementTypeExpExtended(MeasurementData* measurements,
     if (ans != SL_RESULT_OK) {
         return ans;
     }
-    _ultraCapsuleToNormal(node, measurements, count);
+    ultraCapsuleToNormal(node, measurements, count);
 	return SL_RESULT_OK;
 }
 
@@ -517,13 +889,13 @@ sl_result RPLidar::readMeasurementTypeScan(MeasurementData* measurements, size_t
     nodeCount = 0;
 
 	uint8_t recvPos = 0;
-	_serial.setRxTimeout(0);
+	//_serial.setRxTimeout(0);
     //TODO: should we add timeout here intead of while(1)?
 	while((waitTime =  millis() - startTs) <= READ_TIMEOUT_MS) {
 
-		if(_serial.available() < sizeof(recvBuffer))
+		if(available() < sizeof(recvBuffer))
 			continue;
-		size_t bytesRead = _serial.readBytes(recvBuffer, sizeof(recvBuffer));
+		size_t bytesRead = readBytes(recvBuffer, sizeof(recvBuffer));
 		if(bytesRead < sizeof(recvBuffer)) {
 			Serial.println("Error: read less than available should not happen");
 			continue;
@@ -600,23 +972,23 @@ void RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSi
     flushInput();
     
     // Send command header
-    _serial.write(CMD_SYNC_BYTE);
-    _serial.write(cmd);
+    writeByte(CMD_SYNC_BYTE);
+    writeByte(cmd);
     
     // Send payload if any
     if (payload && payloadSize > 0) {
-        _serial.write(payloadSize);
-        _serial.write(payload, payloadSize);
+        writeByte(payloadSize);
+        writeBytes(payload, payloadSize);
         
         // Calculate and send checksum
         uint8_t checksum = CMD_SYNC_BYTE ^ cmd ^ payloadSize;
         for (uint8_t i = 0; i < payloadSize; i++) {
             checksum ^= payload[i];
         }
-        _serial.write(checksum);
+        writeByte(checksum);
     }
     
-    _serial.flush();
+    //_serial.flush();
 }
 
 bool RPLidar::waitResponseHeader() {
@@ -626,9 +998,9 @@ bool RPLidar::waitResponseHeader() {
     //Serial.println("Waiting for response header...");
     
     // Wait for first sync byte
-    while ((millis() - startTime) < READ_TIMEOUT_MS) {
-        if (_serial.available()) {
-            byte = _serial.read();
+    while ((millis() - startTime) < READ_TIMEOUT_MS*10) {
+        if (available()) {
+            byte = readByte();
             //Serial.printf("Got byte: %02X\n", byte);
             if (byte == RESP_SYNC_BYTE1) {
                 //Serial.println("Found first sync byte");
@@ -636,13 +1008,13 @@ bool RPLidar::waitResponseHeader() {
                 // Wait for second sync byte
                 startTime = millis();
                 while ((millis() - startTime) < READ_TIMEOUT_MS) {
-                    if (_serial.available()) {
-                        byte = _serial.read();
+                    if (available()) {
+                        byte = readByte();
                         //Serial.printf("Got second byte: %02X\n", byte);
                         if (byte == RESP_SYNC_BYTE2) {
                             // Read remaining 5 bytes of descriptor
                             uint8_t descriptor[5];
-                            size_t bytesRead = _serial.readBytes(descriptor, 5);
+                            size_t bytesRead = readBytes(descriptor, 5);
                             if (bytesRead != 5) {
                                 Serial.println("Failed to read complete descriptor");
                                 return false;
@@ -697,9 +1069,9 @@ bool RPLidar::verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedTyp
 }
 
 void RPLidar::flushInput() {
-    while (_serial.available()) {
-        _serial.read();
-    }
+    //while (_serial.available()) {
+    //    _serial.read();
+    //}
 }
 
 uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {
@@ -708,4 +1080,34 @@ uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {
         cs ^= data[i];
     }
     return cs;
+}
+
+// Single byte read
+uint8_t RPLidar::readByte() {
+    uint8_t byte;
+    if(uart_read_bytes(UART_NUM, &byte, 1, pdMS_TO_TICKS(RX_TIMEOUT_MS)) == 1) {
+        return byte;
+    }
+    return 0;
+}
+
+// Read multiple bytes
+size_t RPLidar::readBytes(uint8_t* buffer, size_t length) {
+    return uart_read_bytes(UART_NUM, buffer, length, pdMS_TO_TICKS(RX_TIMEOUT_MS));
+}
+
+// Check available bytes
+size_t RPLidar::available() {
+    size_t available_bytes;
+    uart_get_buffered_data_len(UART_NUM, &available_bytes);
+    return available_bytes;
+}
+
+void RPLidar::writeByte(uint8_t byte) {
+    uart_write_bytes(UART_NUM, &byte, 1);
+}
+
+// Write multiple bytes
+void RPLidar::writeBytes(const uint8_t* data, size_t length) {
+    uart_write_bytes(UART_NUM, (const char*)data, length);
 }

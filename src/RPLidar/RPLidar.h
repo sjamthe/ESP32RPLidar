@@ -1,11 +1,43 @@
-#include <stdint.h>
-// RPLidar.h
+
 #ifndef RPLIDAR_H
 #define RPLIDAR_H
 
+#include <stdint.h>
+#include "driver/uart.h"
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include "util.h"
+#include "freertos/ringbuf.h"
+
+// Structure for scan measurement data
+struct MeasurementData {
+	float angle;        // In degrees
+	float distance;     // In millimeters
+	uint8_t quality;    // Quality of measurement
+	bool startFlag;     // Start flag for new scan
+};
+
+//DMA variables. TODO: replace NUM, TX, RX later
+#define UART_NUM UART_NUM_2
+#define UART_TX_PIN 17
+#define UART_RX_PIN 16
+#define UART_BAUD_RATE 115200
+#define RX_TIMEOUT_MS 1
+#define RING_BUFFER_SIZE (1*1024)
+#define UART_RX_BUF_SIZE 256
+
+// Queue configuration
+#define SCANS_PER_PUBLISH 800  // For 10 QPS
+#define MAX_MEASUREMENTS_PER_BATCH 1600
+#define PUBLISH_QUEUE_SIZE 3
+
+// LaserScan batch structure
+struct LaserScanBatch {
+    MeasurementData* measurements;
+    size_t max_measurements;
+    size_t total_measurements;
+    size_t total_rotations;
+};
 
 typedef uint32_t sl_result;
 
@@ -14,6 +46,9 @@ typedef uint32_t sl_result;
 #define RPLIDAR_RESP_MEASUREMENT_CHECKBIT       (0x1<<0)
 #define RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT    1
 #define RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT    (0x1<<15)
+ // Express scan payload sync bytes
+#define RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1     0xA
+#define RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2     0x5
 
 typedef struct _sl_lidar_response_measurement_node_t {
     uint8_t sync_quality;      // syncbit:1;syncbit_inverse:1;quality:6;
@@ -43,14 +78,6 @@ typedef struct _sl_lidar_response_ultra_capsule_measurement_nodes_t
     uint16_t                            start_angle_sync_q6;
     sl_lidar_response_ultra_cabin_nodes_t  ultra_cabins[32];
 } __attribute__((packed)) sl_lidar_response_ultra_capsule_measurement_nodes_t;
-
-// Structure for scan measurement data
-struct MeasurementData {
-	float angle;        // In degrees
-	float distance;     // In millimeters
-	uint8_t quality;    // Quality of measurement
-	bool startFlag;     // Start flag for new scan
-};
 
 class RPLidar {
 public:
@@ -88,10 +115,6 @@ public:
     static const uint8_t RESP_SYNC_BYTE1 = 0xA5;
     static const uint8_t RESP_SYNC_BYTE2 = 0x5A;
 
-    // Express scan payload sync bytes
-    static const uint8_t RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1 = 0xA;
-    static const uint8_t RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2 = 0x5;
-
     // Measurement quality threshold
     static const uint8_t MIN_QUALITY = 0;
     static const uint16_t READ_TIMEOUT_MS = 200;  
@@ -126,14 +149,15 @@ public:
 
     // Constructor
     RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin = -1);
+    ~RPLidar();
 
     // Basic operations
     bool begin(unsigned long baud = 115200);
     void end();
     
     // Core commands
-    bool stop();
-    bool reset();
+    bool stopScan();
+    bool resetLidar();
     bool startScan();
     bool startExpressScan(uint8_t expressScanType = 2);
     bool forceScan();
@@ -146,10 +170,20 @@ public:
     // Data retrieval
     // Declare a function pointer for commin name.
     sl_result readMeasurement(MeasurementData*, size_t&);
+    void ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
+
     
     // Motor control
     void startMotor(uint8_t pwm = 255);
     void stopMotor();
+
+    // New DMA-related methods
+    void setupUartDMA();
+    void setupUartTasks();
+    void stopUartTasks();
+    static void uartRxTask(void* arg);
+    static void processDataTask(void* arg);
+    static void publishTask(void* arg);
 
 private:
     HardwareSerial& _serial;
@@ -163,7 +197,13 @@ private:
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
     bool _is_previous_capsuledataRdy;
     sl_lidar_response_ultra_capsule_measurement_nodes_t _cached_previous_ultracapsuledata;
-
+    
+    // New DMA-related members
+    RingbufHandle_t _uartRingBuf;
+    QueueHandle_t _publishQueue;
+    TaskHandle_t _uartTaskHandle;
+    TaskHandle_t _processTaskHandle;
+    TaskHandle_t _publishTaskHandle;
     // Helper functions
     bool waitResponseHeader();
     void flushInput();
@@ -174,7 +214,11 @@ private:
     sl_result readMeasurementTypeExpExtended(MeasurementData*, size_t&);
     sl_result readMeasurementTypeExpLegacy(MeasurementData*, size_t&);
     sl_result _waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measurement_nodes_t& node, uint32_t timeout = READ_EXP_TIMEOUT_MS);
-    void _ultraCapsuleToNormal(const sl_lidar_response_ultra_capsule_measurement_nodes_t &capsule, MeasurementData *measurements, size_t &nodeCount);
+    uint8_t readByte(); 
+    size_t readBytes(uint8_t* buffer, size_t length);
+    size_t available() ;
+    void writeByte(uint8_t byte);
+    void writeBytes(const uint8_t* data, size_t length);
 };
 
 // Definition of the variable bit scale encoding mechanism
@@ -209,5 +253,15 @@ private:
 
 #define SL_IS_OK(x)    ( ((x) & SL_RESULT_FAIL_BIT) == 0 )
 #define SL_IS_FAIL(x)  ( ((x) & SL_RESULT_FAIL_BIT) )
+
+typedef void (*node_callback_t)(MeasurementData* , size_t );
+
+// Update the task params struct to remove callback
+struct task_params_t {
+    RPLidar *lidar;
+    // callback removed since we're using queue now
+};
+
+//void process_nodes(MeasurementData* measurements, size_t count);
 
 #endif // RPLIDAR_H
