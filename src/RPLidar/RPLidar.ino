@@ -1,22 +1,10 @@
 #include "RPLidar.h"
 
 RPLidar lidar(Serial2, 16, 17, 5); 
+bool scanning = false;
 
-void setup() {
-    // Start USB serial for debugging and wait for port to be ready
-    Serial.begin(115200);
-    delay(2000);  // Give time for USB serial to properly initialize
-    Serial.println("\n\nRPLidar Test Starting...");
-    delay(500);   // Additional delay to ensure stability
-    
-    // Initialize RPLidar
-    Serial.println("Initializing RPLidar...");
-    if (!lidar.begin()) {
-        Serial.println("Failed to start RPLidar");
-        return;
-    }
-    
-    // Get device info
+void  getLidarInfo() {
+// Get device info
     RPLidar::DeviceInfo info;
     if (lidar.getInfo(info)) {
         Serial.println("RPLidar Info:");
@@ -71,9 +59,12 @@ void setup() {
         return;
     }
 
-    // Reset device before starting
+}
+
+void startLidarScan() {
+        // Reset device before starting
     Serial.println("Resetting RPLidar...");
-    lidar.reset();
+    lidar.resetLidar();
     delay(2000);  // Give it time to reset
     
     // Start motor with a clean delay sequence
@@ -90,11 +81,43 @@ void setup() {
         return;
     }
     Serial.println("Scan started successfully");
-
+	scanning = true;
     // Wait for measurements to start
     delay(200);
 }
 
+void setup() {
+    // Start USB serial for debugging and wait for port to be ready
+    Serial.begin(115200);
+    delay(2000);  // Give time for USB serial to properly initialize
+    Serial.println("\n\nRPLidar Test Starting...");
+    delay(500);   // Additional delay to ensure stability
+    
+    // Initialize RPLidar
+    Serial.println("Initializing RPLidar...");
+    if (!lidar.begin()) {
+        Serial.println("Failed to start RPLidar");
+        return;
+    }
+    
+    getLidarInfo();
+
+    startLidarScan();
+}
+
+unsigned long startmillis = millis();
 void loop() {
+    // start & stop every minute
+    if (scanning && (millis() - startmillis) > 1 * 60 * 1000) {
+        lidar.stopScan();
+		scanning = false;
+        Serial.printf("Scan stopped at %d ms\n", millis());
+    } else if (!scanning && (millis() - startmillis) > 2 * 60 * 1000) {
+        if (lidar.startExpressScan()) {
+			scanning = true;
+            startmillis = millis();
+    		Serial.println("Scan restarted successfully after 3 minutes");
+		}
+    }
     delay(100);
 }

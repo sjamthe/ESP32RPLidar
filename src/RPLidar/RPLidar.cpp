@@ -5,14 +5,13 @@
 #include <sys/_stdint.h>
 #include "RPLidar.h"
 
-static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel)
-		{
-	static const uint32_t VBS_SCALED_BASE[] = {
-	SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X8_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X4_DEST_VAL,
-	SL_LIDAR_VARBITSCALE_X2_DEST_VAL,
-			0,
+static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel) {
+        static const uint32_t VBS_SCALED_BASE[] = {
+        SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X8_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X4_DEST_VAL,
+        SL_LIDAR_VARBITSCALE_X2_DEST_VAL,
+		0,
 	};
 
 	static const uint32_t VBS_SCALED_LVL[] = {
@@ -94,6 +93,32 @@ void RPLidar::setupUartDMA() {
     }
 
     Serial.println("UART DMA setup completed successfully");
+}
+
+void RPLidar::stopUartTasks() {
+    // Clean up tasks
+    if (_uartTaskHandle!= NULL) {
+        vTaskDelete(_uartTaskHandle);
+        _uartTaskHandle = NULL;
+    }
+    if (_processTaskHandle!= NULL) {
+        vTaskDelete(_processTaskHandle);
+        _processTaskHandle = NULL;
+    }
+    if (_publishTaskHandle!= NULL) {
+        vTaskDelete(_publishTaskHandle);
+        _publishTaskHandle = NULL;
+    }
+
+    // Clean up ring buffer and queue
+    if (_uartRingBuf) {
+        vRingbufferDelete(_uartRingBuf);
+        _uartRingBuf = NULL;
+    }
+    if (_publishQueue) {
+        vQueueDelete(_publishQueue);
+        _publishQueue = NULL;
+    }
 }
 
 void RPLidar::setupUartTasks() {
@@ -349,6 +374,7 @@ void RPLidar::publishTask(void* arg) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     BaseType_t xWasDelayed;
 
+    startMs = millis();
     while(1) {
         LaserScanBatch* batchToPublish;
         if(xQueueReceive(lidar->_publishQueue, &batchToPublish, 0) == pdTRUE) {
@@ -356,7 +382,6 @@ void RPLidar::publishTask(void* arg) {
             xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
             delayMs += xWasDelayed;
 
-            if(!startMs) startMs = millis();
             totalMeasurements += batchToPublish->total_measurements;
             totalRotations += batchToPublish->total_rotations;
             totalMessages++;
@@ -420,19 +445,21 @@ RPLidar::~RPLidar() {
     // Clean up UART
     uart_driver_delete(UART_NUM);
 }
+
 void RPLidar::end() {
     stopMotor();
-    _serial.end();
     _isConnected = false;
 }
 
-bool RPLidar::stop() {
+bool RPLidar::stopScan() {
     sendCommand(CMD_STOP);
     delay(1); // Per protocol spec, give 1ms gap before other command.
+    stopUartTasks();
+    stopMotor();
     return true;
 }
 
-bool RPLidar::reset() {
+bool RPLidar::resetLidar() {
     sendCommand(CMD_RESET); // reboot lidar microcontroller
     delay(2); // Per protocol spec, give 2ms gap before other command.
     return true;
@@ -442,7 +469,7 @@ bool RPLidar::startScan() {
     if(!_isConnected) return false; // Don't start scan if not connected.
 
     // Stop any previous operation
-    stop();
+    stopScan();
     delay(1);
     
     // Send scan command
@@ -465,12 +492,15 @@ bool RPLidar::startScan() {
 bool RPLidar::startExpressScan(uint8_t expressScanType) {
     if(!_isConnected) return false; // Don't start scan if not connected.
 
-    stop();
-    delay(1);
+    sendCommand(CMD_STOP);
+    delay(1); // Per protocol spec, give 1ms gap before other command.
 
     setupUartTasks();
     //wait a little for tasks to spawn.
     vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Enable motor
+    if(!_motorEnabled) startMotor();
 
     // Express scan command,payload,checksum expected.
     // legacy   82 5 0 0 0 0 22

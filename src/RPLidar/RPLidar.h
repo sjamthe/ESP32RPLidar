@@ -156,8 +156,8 @@ public:
     void end();
     
     // Core commands
-    bool stop();
-    bool reset();
+    bool stopScan();
+    bool resetLidar();
     bool startScan();
     bool startExpressScan(uint8_t expressScanType = 2);
     bool forceScan();
@@ -180,6 +180,7 @@ public:
     // New DMA-related methods
     void setupUartDMA();
     void setupUartTasks();
+    void stopUartTasks();
     static void uartRxTask(void* arg);
     static void processDataTask(void* arg);
     static void publishTask(void* arg);
