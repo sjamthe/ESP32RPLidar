@@ -3,7 +3,7 @@ This is implemented based on Slamtech's RPLidar's [implementation]( https://gith
 
 ## Why was this implemented
 I looksed a few implemenentations for Arduino and ESP32 but they didn't work for one reason or another. Here are some other implementation if you prefer them.
-* [SlamtecLidarESP32](SlamtecLidarESP32) - I would like to use this but needs ESP32 with PSRAM support.
+* [SlamtecLidarESP32](https://github.com/gfvalvo/SlamtecLidarESP32) - I would like to use this but needs ESP32 with PSRAM support.
 * [ESP32_Arduino_RPLIDAR_S2](https://github.com/KKest/ESP-rplidarS2)
 * [an arduino (ESP32) library for the rplidar](https://github.com/thijses/rplidar)
 * [LiDAR Library for Arduino](https://github.com/kaiaai/LDS/tree/main)
