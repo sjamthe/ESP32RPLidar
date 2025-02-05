@@ -17,10 +17,6 @@ struct MeasurementData {
 	bool startFlag;     // Start flag for new scan
 };
 
-//DMA variables. TODO: replace NUM, TX, RX later
-#define UART_NUM UART_NUM_2
-#define UART_TX_PIN 17
-#define UART_RX_PIN 16
 #define UART_BAUD_RATE 115200
 #define RX_TIMEOUT_MS 1
 #define RING_BUFFER_SIZE (1*1024)
@@ -148,7 +144,7 @@ public:
     };
 
     // Constructor
-    RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin = -1);
+    RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin);
     ~RPLidar();
 
     // Basic operations
@@ -185,8 +181,10 @@ public:
     static void processDataTask(void* arg);
     static void publishTask(void* arg);
 
+    QueueHandle_t publishQueue;
+
 private:
-    HardwareSerial& _serial;
+    static uart_port_t _lidarPortNum;
     int _rxPin;
     int _txPin;
     int _motorPin;
@@ -200,7 +198,6 @@ private:
     
     // New DMA-related members
     RingbufHandle_t _uartRingBuf;
-    QueueHandle_t _publishQueue;
     TaskHandle_t _uartTaskHandle;
     TaskHandle_t _processTaskHandle;
     TaskHandle_t _publishTaskHandle;

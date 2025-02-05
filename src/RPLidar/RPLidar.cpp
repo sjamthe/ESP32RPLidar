@@ -5,6 +5,8 @@
 #include <sys/_stdint.h>
 #include "RPLidar.h"
 
+uart_port_t RPLidar::_lidarPortNum = UART_NUM_2;
+
 static uint32_t _varbitscale_decode(uint32_t scaled, uint32_t &scaleLevel) {
         static const uint32_t VBS_SCALED_BASE[] = {
         SL_LIDAR_VARBITSCALE_X16_DEST_VAL,
@@ -56,12 +58,13 @@ static void convert(const sl_lidar_response_measurement_node_hq_t &from, Measure
     convert(to, measurement);
 }
 
-RPLidar::RPLidar(HardwareSerial& serial, int rxPin, int txPin, int motorPin)
-    : _serial(serial), _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
+RPLidar::RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin)
+    : _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
+      _lidarPortNum = lidarPortNum;
 }
 void RPLidar::setupUartDMA() {
     uart_config_t uart_config = {
-        .baud_rate = 115200,
+        .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -71,22 +74,22 @@ void RPLidar::setupUartDMA() {
     esp_err_t err;
     
     // First delete any existing UART driver
-    uart_driver_delete(UART_NUM);
+    uart_driver_delete(_lidarPortNum);
     vTaskDelay(pdMS_TO_TICKS(10));  // Give some time for cleanup
     
-    err = uart_param_config(UART_NUM, &uart_config);
+    err = uart_param_config(_lidarPortNum, &uart_config);
     if (err != ESP_OK) {
         Serial.printf("Failed to configure UART parameters: %d\n", err);
         return;
     }
 
-    err = uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    err = uart_set_pin(_lidarPortNum, _txPin, _rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         Serial.printf("Failed to set UART pins: %d\n", err);
         return;
     }
 
-    err = uart_driver_install(UART_NUM, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    err = uart_driver_install(_lidarPortNum, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
     if (err != ESP_OK) {
         Serial.printf("Failed to install UART driver: %d\n", err);
         return;
@@ -115,9 +118,9 @@ void RPLidar::stopUartTasks() {
         vRingbufferDelete(_uartRingBuf);
         _uartRingBuf = NULL;
     }
-    if (_publishQueue) {
-        vQueueDelete(_publishQueue);
-        _publishQueue = NULL;
+    if (publishQueue) {
+        vQueueDelete(publishQueue);
+        publishQueue = NULL;
     }
 }
 
@@ -133,9 +136,9 @@ void RPLidar::setupUartTasks() {
     }
     
     // Create publish queue if not already created
-    if (_publishQueue == NULL) {
-        _publishQueue = xQueueCreate(PUBLISH_QUEUE_SIZE, sizeof(LaserScanBatch*));
-        if (_publishQueue == NULL) {
+    if (publishQueue == NULL) {
+        publishQueue = xQueueCreate(PUBLISH_QUEUE_SIZE, sizeof(LaserScanBatch*));
+        if (publishQueue == NULL) {
             Serial.println("Failed to create publish queue");
             return;
         }
@@ -177,7 +180,7 @@ void RPLidar::setupUartTasks() {
         Serial.println("Process data task created successfully");
     }
 
-    if (_publishTaskHandle == NULL) {
+   /* if (_publishTaskHandle == NULL) {
         BaseType_t result = xTaskCreatePinnedToCore(
             publishTask,
             "publish",
@@ -192,7 +195,7 @@ void RPLidar::setupUartTasks() {
             return;
         }
         Serial.println("Publish task created successfully");
-    }
+    }*/
     
     // Give tasks time to initialize
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -209,10 +212,10 @@ void RPLidar::uartRxTask(void* arg) {
 
     while(1) {
         size_t length = 0;
-        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM, &length));
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(_lidarPortNum, &length));
         
         if(length > 0) {
-            length = uart_read_bytes(UART_NUM, tempBuffer, 
+            length = uart_read_bytes(_lidarPortNum, tempBuffer, 
                                    min(length, (size_t)UART_RX_BUF_SIZE), 
                                    pdMS_TO_TICKS(20));
             if(length > 0) {
@@ -326,7 +329,7 @@ void RPLidar::processDataTask(void* arg) {
                                     if(currentBatch->total_rotations >= 1) {
                                     //if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
                                         // Queue the batch
-                                        if(xQueueSend(lidar->_publishQueue, &currentBatch, 0) != pdTRUE) {
+                                        if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
                                             // Queue full, clean up
                                             free(currentBatch->measurements);
                                             delete currentBatch;
@@ -377,7 +380,7 @@ void RPLidar::publishTask(void* arg) {
     startMs = millis();
     while(1) {
         LaserScanBatch* batchToPublish;
-        if(xQueueReceive(lidar->_publishQueue, &batchToPublish, 0) == pdTRUE) {
+        if(xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
             //test some delays
             xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
             delayMs += xWasDelayed;
@@ -395,7 +398,7 @@ void RPLidar::publishTask(void* arg) {
                     1.0*totalMeasurements/totalRotations,
                     totalMeasurements,
                     1000.0 * totalMeasurements / (millis() - startMs),
-                    uxQueueSpacesAvailable(lidar->_publishQueue),
+                    uxQueueSpacesAvailable(lidar->publishQueue),
                     delayMs);
 
                 totalMeasurements = 0;
@@ -426,7 +429,7 @@ bool RPLidar::begin(unsigned long baud) {
     _processTaskHandle = NULL;
     _publishTaskHandle = NULL;
     _uartRingBuf = NULL;
-    _publishQueue = NULL;
+    publishQueue = NULL;
     
     flushInput();
     return true;
@@ -440,10 +443,10 @@ RPLidar::~RPLidar() {
     
     // Clean up ring buffer and queue
     if (_uartRingBuf) vRingbufferDelete(_uartRingBuf);
-    if (_publishQueue) vQueueDelete(_publishQueue);
+    if (publishQueue) vQueueDelete(publishQueue);
     
     // Clean up UART
-    uart_driver_delete(UART_NUM);
+    uart_driver_delete(_lidarPortNum);
 }
 
 void RPLidar::end() {
@@ -1085,7 +1088,7 @@ uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {
 // Single byte read
 uint8_t RPLidar::readByte() {
     uint8_t byte;
-    if(uart_read_bytes(UART_NUM, &byte, 1, pdMS_TO_TICKS(RX_TIMEOUT_MS)) == 1) {
+    if(uart_read_bytes(_lidarPortNum, &byte, 1, pdMS_TO_TICKS(RX_TIMEOUT_MS)) == 1) {
         return byte;
     }
     return 0;
@@ -1093,21 +1096,21 @@ uint8_t RPLidar::readByte() {
 
 // Read multiple bytes
 size_t RPLidar::readBytes(uint8_t* buffer, size_t length) {
-    return uart_read_bytes(UART_NUM, buffer, length, pdMS_TO_TICKS(RX_TIMEOUT_MS));
+    return uart_read_bytes(_lidarPortNum, buffer, length, pdMS_TO_TICKS(RX_TIMEOUT_MS));
 }
 
 // Check available bytes
 size_t RPLidar::available() {
     size_t available_bytes;
-    uart_get_buffered_data_len(UART_NUM, &available_bytes);
+    uart_get_buffered_data_len(_lidarPortNum, &available_bytes);
     return available_bytes;
 }
 
 void RPLidar::writeByte(uint8_t byte) {
-    uart_write_bytes(UART_NUM, &byte, 1);
+    uart_write_bytes(_lidarPortNum, &byte, 1);
 }
 
 // Write multiple bytes
 void RPLidar::writeBytes(const uint8_t* data, size_t length) {
-    uart_write_bytes(UART_NUM, (const char*)data, length);
+    uart_write_bytes(_lidarPortNum, (const char*)data, length);
 }

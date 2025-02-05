@@ -1,7 +1,9 @@
 #include "RPLidar.h"
 
-RPLidar lidar(Serial2, 16, 17, 5); 
+RPLidar lidar(UART_NUM_2, 39, 40, 41); 
+TaskHandle_t publishTaskHandle = NULL;
 bool scanning = false;
+void createPublishTask();
 
 void  getLidarInfo() {
 // Get device info
@@ -81,7 +83,9 @@ void startLidarScan() {
         return;
     }
     Serial.println("Scan started successfully");
-	scanning = true;
+    createPublishTask();
+
+	  scanning = true;
     // Wait for measurements to start
     delay(200);
 }
@@ -105,19 +109,97 @@ void setup() {
     startLidarScan();
 }
 
-unsigned long startmillis = millis();
+void createPublishTask() {
+    if (publishTaskHandle == NULL) {
+        BaseType_t result = xTaskCreatePinnedToCore(
+            publishTask,
+            "publish",
+            8192,  // Increased stack size
+            NULL,
+            4, // priority
+            &publishTaskHandle,
+            1 // core
+        );
+        if (result != pdPASS) {
+            Serial.println("Failed to create publish task");
+            return;
+        }
+        Serial.println("Publish task created successfully");
+    }
+}
+
+void publishTask(void* arg) {
+    //RPLidar* lidar = static_cast<RPLidar*>(arg);
+    static unsigned long totalMeasurements = 0;
+    static unsigned long totalRotations = 0;
+    static unsigned long totalMessages = 0;
+    unsigned long startMs = 0;
+    unsigned long delayMs = 0;
+    const TickType_t xFrequency = pdMS_TO_TICKS(80);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    BaseType_t xWasDelayed;
+
+    startMs = millis();
+    while(lidar.publishQueue == NULL) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    while(1) {
+        LaserScanBatch* batchToPublish;
+        if(lidar.publishQueue == NULL) vTaskDelete(NULL);
+
+        if(xQueueReceive(lidar.publishQueue, &batchToPublish, 0) == pdTRUE) {
+            //test some delays
+            xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+            delayMs += xWasDelayed;
+
+            totalMeasurements += batchToPublish->total_measurements;
+            totalRotations += batchToPublish->total_rotations;
+            totalMessages++;
+            
+            if(totalMessages >= 120) {
+                Serial.printf("Published: %d, pubs (ms): %.0f, mes/rot: %.1f, "
+                            "Measurements: %d, Rate: %.0f measurements/s,"
+                            "Free queue space: %d, Delays(ms): %d\n",
+                    totalMessages,
+                    1.0*(millis() - startMs)/totalMessages,
+                    1.0*totalMeasurements/totalRotations,
+                    totalMeasurements,
+                    1000.0 * totalMeasurements / (millis() - startMs),
+                    uxQueueSpacesAvailable(lidar.publishQueue),
+                    delayMs);
+
+                totalMeasurements = 0;
+                totalRotations = 0;
+                totalMessages = 0;
+                delayMs = 0;
+                startMs = millis();
+            }
+            
+            free(batchToPublish->measurements);
+            delete batchToPublish;
+        }
+        startStop();
+    }
+}
+
 void loop() {
+
+}
+
+unsigned long startmillis = 0;
+void startStop() {
+    if(!startmillis) startmillis = millis();
+
     // start & stop every minute
     if (scanning && (millis() - startmillis) > 1 * 60 * 1000) {
         lidar.stopScan();
-		scanning = false;
+		    scanning = false;
         Serial.printf("Scan stopped at %d ms\n", millis());
     } else if (!scanning && (millis() - startmillis) > 2 * 60 * 1000) {
         if (lidar.startExpressScan()) {
-			scanning = true;
+			      scanning = true;
             startmillis = millis();
-    		Serial.println("Scan restarted successfully after 3 minutes");
-		}
+    		    Serial.println("Scan restarted successfully after 3 minutes");
+		    }
     }
-    delay(100);
 }
