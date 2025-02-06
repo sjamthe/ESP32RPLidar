@@ -4,7 +4,6 @@
 #include "Arduino.h"
 #include <sys/_stdint.h>
 #include "RPLidar.h"
-#include "FixedLaserScanBatchPool.h"
 
 uart_port_t RPLidar::_lidarPortNum = UART_NUM_2;
 
