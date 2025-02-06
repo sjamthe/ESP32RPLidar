@@ -4,6 +4,7 @@
 #include "Arduino.h"
 #include <sys/_stdint.h>
 #include "RPLidar.h"
+#include "FixedLaserScanBatchPool.h"
 
 uart_port_t RPLidar::_lidarPortNum = UART_NUM_2;
 
@@ -58,10 +59,19 @@ static void convert(const sl_lidar_response_measurement_node_hq_t &from, Measure
     convert(to, measurement);
 }
 
-RPLidar::RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin)
-    : _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false) {
+RPLidar::RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin, LaserScanBatchPool* pool)
+    : _rxPin(rxPin), _txPin(txPin), _motorPin(motorPin), _isConnected(false), _motorEnabled(false),  _batchPool(pool) {
       _lidarPortNum = lidarPortNum;
 }
+
+size_t RPLidar::calculateRecommendedPoolSize(
+    float lidarRotationHz,     // LIDAR rotation frequency
+    float processingTimeMs     // Expected processing time per batch
+) {
+    float batchesInFlight = (lidarRotationHz * processingTimeMs / 1000.0);
+    return ceil(batchesInFlight) + 1;  // Add 1 for buffer
+}
+
 void RPLidar::setupUartDMA() {
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
@@ -125,8 +135,11 @@ void RPLidar::stopUartTasks() {
 }
 
 void RPLidar::setupUartTasks() {
+    Serial.println("Setting up UART tasks...");
+    
     // Create ring buffer if not already created
     if (_uartRingBuf == NULL) {
+        Serial.println("Creating ring buffer...");
         _uartRingBuf = xRingbufferCreate(RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
         if (_uartRingBuf == NULL) {
             Serial.println("Failed to create ring buffer");
@@ -136,8 +149,9 @@ void RPLidar::setupUartTasks() {
     }
     
     // Create publish queue if not already created
-    if (publishQueue == NULL) {
-        publishQueue = xQueueCreate(PUBLISH_QUEUE_SIZE, sizeof(LaserScanBatch*));
+    if (publishQueue == NULL && _batchPool != NULL) {
+        size_t queueSize = _batchPool->getNumOfBatches();
+        publishQueue = xQueueCreate(queueSize, sizeof(LaserScanBatch*));
         if (publishQueue == NULL) {
             Serial.println("Failed to create publish queue");
             return;
@@ -147,10 +161,11 @@ void RPLidar::setupUartTasks() {
 
     // Create tasks if they don't exist
     if (_uartTaskHandle == NULL) {
+        Serial.println("Creating UART RX task...");
         BaseType_t result = xTaskCreatePinnedToCore(
             uartRxTask,
             "uart_rx",
-            4096,  // Increased stack size
+            4096,
             this,
             5,
             &_uartTaskHandle,
@@ -162,14 +177,18 @@ void RPLidar::setupUartTasks() {
         }
         Serial.println("UART RX task created successfully");
     }
-
+    
+    vTaskDelay(pdMS_TO_TICKS(50)); // Give UART task time to start
+    
+    // Create process task
     if (_processTaskHandle == NULL) {
+        Serial.println("Creating process task...");
         BaseType_t result = xTaskCreatePinnedToCore(
             processDataTask,
             "process_data",
-            16384,  // Increased stack size
+            16384,
             this,
-            5,
+            4,
             &_processTaskHandle,
             1
         );
@@ -179,26 +198,14 @@ void RPLidar::setupUartTasks() {
         }
         Serial.println("Process data task created successfully");
     }
-
-   /* if (_publishTaskHandle == NULL) {
-        BaseType_t result = xTaskCreatePinnedToCore(
-            publishTask,
-            "publish",
-            8192,  // Increased stack size
-            this,
-            4,
-            &_publishTaskHandle,
-            1
-        );
-        if (result != pdPASS) {
-            Serial.println("Failed to create publish task");
-            return;
-        }
-        Serial.println("Publish task created successfully");
-    }*/
     
-    // Give tasks time to initialize
+    // Final check
     vTaskDelay(pdMS_TO_TICKS(100));
+    if (_uartTaskHandle && _processTaskHandle) {
+        Serial.println("All tasks running");
+    } else {
+        Serial.println("Task creation failed");
+    }
 }
 
 void RPLidar::uartRxTask(void* arg) {
@@ -219,6 +226,7 @@ void RPLidar::uartRxTask(void* arg) {
                                    min(length, (size_t)UART_RX_BUF_SIZE), 
                                    pdMS_TO_TICKS(20));
             if(length > 0) {
+                //Serial.printf("UART received %d bytes\n", length);
                 BaseType_t retval = xRingbufferSend(lidar->_uartRingBuf, 
                                                    tempBuffer, length, 
                                                    pdMS_TO_TICKS(10));
@@ -249,21 +257,63 @@ void RPLidar::uartRxTask(void* arg) {
 }
 
 void RPLidar::processDataTask(void* arg) {
+    Serial.println("Process task starting...");
+
+    // Give other tasks a chance to run
+    vTaskDelay(pdMS_TO_TICKS(1));
+
     RPLidar* lidar = static_cast<RPLidar*>(arg);
-    uint8_t tempBuffer[sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)];
-    size_t processPos = 0;
-    
-    LaserScanBatch* currentBatch = new LaserScanBatch();
-    if (!currentBatch || !(currentBatch->measurements = 
-        (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData)))) {
-        Serial.println("Failed to allocate batch resources");
-        delete currentBatch;
+    if (!lidar) {
+        Serial.println("Invalid lidar pointer in process task");
+        vTaskDelete(NULL);
         return;
     }
     
-    currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
-    currentBatch->total_measurements = 0;
-    currentBatch->total_rotations = 0;
+    Serial.println("Checking ring buffer...");
+    if (!lidar->_uartRingBuf) {
+        Serial.println("Ring buffer not initialized");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    Serial.println("Checking batch pool...");
+    if (!lidar->_batchPool) {
+        Serial.println("Batch pool not initialized");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    Serial.println("Checking for lidar->publishQueue");
+    if(!lidar->publishQueue) {
+        Serial.println("publishQueue not initialized");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Allow some time for serial prints and other tasks
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    Serial.println("Allocating temp buffer...");   
+    uint8_t* tempBuffer = (uint8_t*)pvPortMalloc(sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t));
+    if (!tempBuffer) {
+        Serial.println("Failed to allocate temp buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+    size_t processPos = 0;
+    
+    Serial.println("Getting initial batch...");
+    LaserScanBatch* currentBatch = lidar->_batchPool->acquireBatch();
+    if (!currentBatch) {
+        Serial.println("Failed to acquire batch from pool");
+        vPortFree(tempBuffer);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    Serial.println("Process task entering main loop");
+    const TickType_t xDelay = pdMS_TO_TICKS(1); // 10ms delay if no data
+    size_t emptyCount = 0;
 
     while(1) {
         size_t itemSize;
@@ -272,6 +322,9 @@ void RPLidar::processDataTask(void* arg) {
         if(item != NULL) {
             // parse every byte of the buffer looking for the beginning of the node package 
             for(size_t i = 0; i < itemSize; i++) {
+                /*if((i % 100) == 0) { // Yield every 100 bytes
+                    taskYIELD();
+                }*/
                 uint8_t currentByte = item[i];
                 
                 switch(processPos) {
@@ -309,8 +362,9 @@ void RPLidar::processDataTask(void* arg) {
                             }
                             processPos = 0;
                             //if checksum is ok extract measurementdata (96 measurements) from this node.
+                            
                             if(recvChecksum == checksum) {
-                                    MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
+                                MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
                                 size_t count = 0;
                                 lidar->ultraCapsuleToNormal(*node, measurements, count);
                                 
@@ -326,92 +380,42 @@ void RPLidar::processDataTask(void* arg) {
                                     }
                                         
                                     // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
+                                    // When batch is full:
                                     if(currentBatch->total_rotations >= 1) {
-                                    //if(currentBatch->total_measurements >= SCANS_PER_PUBLISH) {
-                                        // Queue the batch
                                         if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
-                                            // Queue full, clean up
-                                            free(currentBatch->measurements);
-                                            delete currentBatch;
+                                            // Queue full, return batch to pool
+                                            lidar->_batchPool->releaseBatch(currentBatch);
                                             Serial.println("Queue full, batch dropped");
                                         }
                                         
-                                        // Create new batch
-                                        currentBatch = new LaserScanBatch();
+                                        // Get new batch from pool
+                                        currentBatch = lidar->_batchPool->acquireBatch();
                                         if (!currentBatch) {
-                                            Serial.println("Failed to allocate new batch");
+                                            Serial.println("Failed to acquire new batch from pool");
                                             continue;
-                                        }
-                                        
-                                        currentBatch->measurements = (MeasurementData*)malloc(MAX_MEASUREMENTS_PER_BATCH * sizeof(MeasurementData));
-                                        if (!currentBatch->measurements) {
-                                            Serial.println("Failed to allocate measurements array");
-                                            delete currentBatch;
-                                            continue;
-                                        }
-                                        
-                                        currentBatch->max_measurements = MAX_MEASUREMENTS_PER_BATCH;
-                                        currentBatch->total_measurements = 0;
-                                        currentBatch->total_rotations = 0;
-                                    }
-
-                                }
-                            }
-						}
+                                        } // end if
+                                    } // end if
+                                } // end for
+						    } // end if
+                        } // end if(processPos
                         break;
-                }
-            }
+
+                } // end switch
+            } // end of for
+            
             vRingbufferReturnItem(lidar->_uartRingBuf, item);
-        }
-    }
-}
-
-void RPLidar::publishTask(void* arg) {
-    RPLidar* lidar = static_cast<RPLidar*>(arg);
-    static unsigned long totalMeasurements = 0;
-    static unsigned long totalRotations = 0;
-    static unsigned long totalMessages = 0;
-    unsigned long startMs = 0;
-    unsigned long delayMs = 0;
-    const TickType_t xFrequency = pdMS_TO_TICKS(80);
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    BaseType_t xWasDelayed;
-
-    startMs = millis();
-    while(1) {
-        LaserScanBatch* batchToPublish;
-        if(xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
-            //test some delays
-            xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
-            delayMs += xWasDelayed;
-
-            totalMeasurements += batchToPublish->total_measurements;
-            totalRotations += batchToPublish->total_rotations;
-            totalMessages++;
-            
-            if(totalMessages >= 120) {
-                Serial.printf("Published: %d, pubs (ms): %.0f, mes/rot: %.1f, "
-                            "Measurements: %d, Rate: %.0f measurements/s,"
-                            "Free queue space: %d, Delays(ms): %d\n",
-                    totalMessages,
-                    1.0*(millis() - startMs)/totalMessages,
-                    1.0*totalMeasurements/totalRotations,
-                    totalMeasurements,
-                    1000.0 * totalMeasurements / (millis() - startMs),
-                    uxQueueSpacesAvailable(lidar->publishQueue),
-                    delayMs);
-
-                totalMeasurements = 0;
-                totalRotations = 0;
-                totalMessages = 0;
-                delayMs = 0;
-                startMs = millis();
+            emptyCount = 0;
+        }  else {
+            emptyCount++;
+            if(emptyCount > 1000) { // If no data for a while
+                emptyCount = 0;
+                Serial.println("No data received for a while");
             }
-            
-            free(batchToPublish->measurements);
-            delete batchToPublish;
-        }
-    }
+            vTaskDelay(xDelay);
+        } // end of else
+        // Add an explicit yield every few iterations
+        taskYIELD();
+    } // end of while
 }
 
 bool RPLidar::begin(unsigned long baud) {

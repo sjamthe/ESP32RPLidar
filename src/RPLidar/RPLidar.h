@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include "driver/uart.h"
 #include <Arduino.h>
-#include <HardwareSerial.h>
+//#include <HardwareSerial.h>
 #include "util.h"
 #include "freertos/ringbuf.h"
 
@@ -24,8 +24,7 @@ struct MeasurementData {
 
 // Queue configuration
 #define SCANS_PER_PUBLISH 800  // For 10 QPS
-#define MAX_MEASUREMENTS_PER_BATCH 1600
-#define PUBLISH_QUEUE_SIZE 3
+#define MAX_MEASUREMENTS_PER_BATCH (2*SCANS_PER_PUBLISH)
 
 // LaserScan batch structure
 struct LaserScanBatch {
@@ -33,6 +32,12 @@ struct LaserScanBatch {
     size_t max_measurements;
     size_t total_measurements;
     size_t total_rotations;
+};
+
+struct LaserScanBatchPool {
+    virtual LaserScanBatch* acquireBatch() = 0;
+    virtual void releaseBatch(LaserScanBatch* batch) = 0;
+    virtual size_t getNumOfBatches() const = 0;
 };
 
 typedef uint32_t sl_result;
@@ -144,8 +149,10 @@ public:
     };
 
     // Constructor
-    RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin);
+    RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin, LaserScanBatchPool* pool);
     ~RPLidar();
+
+    static size_t calculateRecommendedPoolSize(float lidarRotationHz, float processingTimeMs);
 
     // Basic operations
     bool begin(unsigned long baud = 115200);
@@ -179,7 +186,6 @@ public:
     void stopUartTasks();
     static void uartRxTask(void* arg);
     static void processDataTask(void* arg);
-    static void publishTask(void* arg);
 
     QueueHandle_t publishQueue;
 
@@ -195,6 +201,7 @@ private:
     ResponseDescriptor _responseDescriptor;  // Store the last response descriptor
     bool _is_previous_capsuledataRdy;
     sl_lidar_response_ultra_capsule_measurement_nodes_t _cached_previous_ultracapsuledata;
+    LaserScanBatchPool* _batchPool;
     
     // New DMA-related members
     RingbufHandle_t _uartRingBuf;
