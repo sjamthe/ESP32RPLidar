@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include "driver/uart.h"
 #include <Arduino.h>
-//#include <HardwareSerial.h>
 #include "util.h"
 #include "freertos/ringbuf.h"
+
+static const char* TAG = "RPLidar";
 
 // Structure for scan measurement data
 struct MeasurementData {

@@ -6,17 +6,17 @@ FixedLaserScanBatchPool::FixedLaserScanBatchPool(size_t numBatches) :
         _maxUsed(0),
         _mutex(portMUX_INITIALIZER_UNLOCKED) {
             
-        Serial.println("Initializing batch pool...");
+        ESP_LOGV(TAG,"Initializing batch pool...");
         
         _batches = new LaserScanBatch[numBatches];
         if (!_batches) {
-            Serial.println("Failed to allocate batches array");
+            ESP_LOGE(TAG, "Failed to allocate batches array");
             return;
         }
         
         _measurements = new MeasurementData[numBatches * MAX_MEASUREMENTS_PER_BATCH];
         if (!_measurements) {
-            Serial.println("Failed to allocate measurements array");
+            ESP_LOGE(TAG, "Failed to allocate measurements array");
             delete[] _batches;
             _batches = nullptr;
             return;
@@ -24,7 +24,7 @@ FixedLaserScanBatchPool::FixedLaserScanBatchPool(size_t numBatches) :
         
         _available = new bool[numBatches];
         if (!_available) {
-            Serial.println("Failed to allocate available array");
+            ESP_LOGE(TAG, "Failed to allocate available array");
             delete[] _batches;
             delete[] _measurements;
             _batches = nullptr;
@@ -33,16 +33,15 @@ FixedLaserScanBatchPool::FixedLaserScanBatchPool(size_t numBatches) :
         }
         
         _numBatches = numBatches;
-        Serial.printf("Initializing %d batches\n", numBatches);
+        ESP_LOGV(TAG,"Initializing %d batches\n", numBatches);
         
         for(size_t i = 0; i < numBatches; i++) {
             _batches[i].measurements = &_measurements[i * MAX_MEASUREMENTS_PER_BATCH];
             _batches[i].max_measurements = MAX_MEASUREMENTS_PER_BATCH;
             _available[i] = true;
-            //Serial.printf("Batch %d initialized\n", i);
         }
         
-        Serial.println("Batch pool initialization complete");
+        ESP_LOGV(TAG,"Batch pool initialization complete");
 }
 
 FixedLaserScanBatchPool::~FixedLaserScanBatchPool() {

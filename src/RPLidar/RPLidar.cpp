@@ -89,23 +89,23 @@ void RPLidar::setupUartDMA() {
     
     err = uart_param_config(_lidarPortNum, &uart_config);
     if (err != ESP_OK) {
-        Serial.printf("Failed to configure UART parameters: %d\n", err);
+        ESP_LOGE(TAG, "Failed to configure UART parameters: %d\n", err);
         return;
     }
 
     err = uart_set_pin(_lidarPortNum, _txPin, _rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
-        Serial.printf("Failed to set UART pins: %d\n", err);
+        ESP_LOGE(TAG, "Failed to set UART pins: %d\n", err);
         return;
     }
 
     err = uart_driver_install(_lidarPortNum, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
     if (err != ESP_OK) {
-        Serial.printf("Failed to install UART driver: %d\n", err);
+        ESP_LOGE(TAG, "Failed to install UART driver: %d\n", err);
         return;
     }
 
-    Serial.println("UART DMA setup completed successfully");
+    ESP_LOGV(TAG, "UART DMA setup completed successfully");
 }
 
 void RPLidar::stopUartTasks() {
@@ -135,17 +135,17 @@ void RPLidar::stopUartTasks() {
 }
 
 void RPLidar::setupUartTasks() {
-    Serial.println("Setting up UART tasks...");
+    ESP_LOGV(TAG, "Setting up UART tasks...");
     
     // Create ring buffer if not already created
     if (_uartRingBuf == NULL) {
-        Serial.println("Creating ring buffer...");
+        ESP_LOGV(TAG, "Creating ring buffer...");
         _uartRingBuf = xRingbufferCreate(RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
         if (_uartRingBuf == NULL) {
-            Serial.println("Failed to create ring buffer");
+            ESP_LOGE(TAG, "Failed to create ring buffer");
             return;
         }
-        Serial.println("Ring buffer created successfully");
+        ESP_LOGV(TAG, "Ring buffer created successfully");
     }
     
     // Create publish queue if not already created
@@ -153,15 +153,15 @@ void RPLidar::setupUartTasks() {
         size_t queueSize = _batchPool->getNumOfBatches();
         publishQueue = xQueueCreate(queueSize, sizeof(LaserScanBatch*));
         if (publishQueue == NULL) {
-            Serial.println("Failed to create publish queue");
+            ESP_LOGE(TAG, "Failed to create publish queue");
             return;
         }
-        Serial.println("Publish queue created successfully");
+        ESP_LOGV(TAG, "Publish queue created successfully");
     }
 
     // Create tasks if they don't exist
     if (_uartTaskHandle == NULL) {
-        Serial.println("Creating UART RX task...");
+        ESP_LOGV(TAG, "Creating UART RX task...");
         BaseType_t result = xTaskCreatePinnedToCore(
             uartRxTask,
             "uart_rx",
@@ -172,17 +172,17 @@ void RPLidar::setupUartTasks() {
             1
         );
         if (result != pdPASS) {
-            Serial.println("Failed to create uart_rx task");
+            ESP_LOGE(TAG, "Failed to create uart_rx task");
             return;
         }
-        Serial.println("UART RX task created successfully");
+        ESP_LOGV(TAG, "UART RX task created successfully");
     }
     
     vTaskDelay(pdMS_TO_TICKS(50)); // Give UART task time to start
     
     // Create process task
     if (_processTaskHandle == NULL) {
-        Serial.println("Creating process task...");
+        ESP_LOGV(TAG, "Creating process task...");
         BaseType_t result = xTaskCreatePinnedToCore(
             processDataTask,
             "process_data",
@@ -193,18 +193,18 @@ void RPLidar::setupUartTasks() {
             1
         );
         if (result != pdPASS) {
-            Serial.println("Failed to create process_data task");
+            ESP_LOGE(TAG, "Failed to create process_data task");
             return;
         }
-        Serial.println("Process data task created successfully");
+        ESP_LOGV(TAG, "Process data task created successfully");
     }
     
     // Final check
     vTaskDelay(pdMS_TO_TICKS(100));
     if (_uartTaskHandle && _processTaskHandle) {
-        Serial.println("All tasks running");
+        ESP_LOGV(TAG, "All tasks running");
     } else {
-        Serial.println("Task creation failed");
+        ESP_LOGE(TAG, "Task creation failed");
     }
 }
 
@@ -226,7 +226,7 @@ void RPLidar::uartRxTask(void* arg) {
                                    min(length, (size_t)UART_RX_BUF_SIZE), 
                                    pdMS_TO_TICKS(20));
             if(length > 0) {
-                //Serial.printf("UART received %d bytes\n", length);
+                //ESP_LOGV(TAG, "UART received %d bytes\n", length);
                 BaseType_t retval = xRingbufferSend(lidar->_uartRingBuf, 
                                                    tempBuffer, length, 
                                                    pdMS_TO_TICKS(10));
@@ -244,7 +244,7 @@ void RPLidar::uartRxTask(void* arg) {
         // Print statistics periodically
         unsigned long now = millis();
         if ((readBytes + lostBytes) >= 132000) {
-            Serial.printf("\nSends: %d, Bytes read:%d, lost:%d, bps: %5.0f min_free_size: %d\n",
+            ESP_LOGI(TAG, "\nSends: %d, Bytes read:%d, lost:%d, bps: %5.0f min_free_size: %d\n",
                 sends, readBytes, lostBytes, 
                 readBytes*9*1000.0/(now - startMillis), minFreeSize);
             readBytes = 0;
@@ -257,35 +257,35 @@ void RPLidar::uartRxTask(void* arg) {
 }
 
 void RPLidar::processDataTask(void* arg) {
-    Serial.println("Process task starting...");
+    ESP_LOGV(TAG, "Process task starting...");
 
     // Give other tasks a chance to run
     vTaskDelay(pdMS_TO_TICKS(1));
 
     RPLidar* lidar = static_cast<RPLidar*>(arg);
     if (!lidar) {
-        Serial.println("Invalid lidar pointer in process task");
+        ESP_LOGE(TAG, "Invalid lidar pointer in process task");
         vTaskDelete(NULL);
         return;
     }
     
-    Serial.println("Checking ring buffer...");
+    ESP_LOGV(TAG, "Checking ring buffer...");
     if (!lidar->_uartRingBuf) {
-        Serial.println("Ring buffer not initialized");
+        ESP_LOGE(TAG, "Ring buffer not initialized");
         vTaskDelete(NULL);
         return;
     }
     
-    Serial.println("Checking batch pool...");
+    ESP_LOGV(TAG, "Checking batch pool...");
     if (!lidar->_batchPool) {
-        Serial.println("Batch pool not initialized");
+        ESP_LOGE(TAG, "Batch pool not initialized");
         vTaskDelete(NULL);
         return;
     }
 
-    Serial.println("Checking for lidar->publishQueue");
+    ESP_LOGV(TAG, "Checking for lidar->publishQueue");
     if(!lidar->publishQueue) {
-        Serial.println("publishQueue not initialized");
+        ESP_LOGE(TAG, "publishQueue not initialized");
         vTaskDelete(NULL);
         return;
     }
@@ -293,25 +293,25 @@ void RPLidar::processDataTask(void* arg) {
     // Allow some time for serial prints and other tasks
     vTaskDelay(pdMS_TO_TICKS(1));
     
-    Serial.println("Allocating temp buffer...");   
+    ESP_LOGV(TAG, "Allocating temp buffer...");   
     uint8_t* tempBuffer = (uint8_t*)pvPortMalloc(sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t));
     if (!tempBuffer) {
-        Serial.println("Failed to allocate temp buffer");
+        ESP_LOGE(TAG, "Failed to allocate temp buffer");
         vTaskDelete(NULL);
         return;
     }
     size_t processPos = 0;
     
-    Serial.println("Getting initial batch...");
+    ESP_LOGV(TAG, "Getting initial batch...");
     LaserScanBatch* currentBatch = lidar->_batchPool->acquireBatch();
     if (!currentBatch) {
-        Serial.println("Failed to acquire batch from pool");
+        ESP_LOGE(TAG, "Failed to acquire batch from pool");
         vPortFree(tempBuffer);
         vTaskDelete(NULL);
         return;
     }
     
-    Serial.println("Process task entering main loop");
+    ESP_LOGV(TAG, "Process task entering main loop");
     const TickType_t xDelay = pdMS_TO_TICKS(1); // 10ms delay if no data
     size_t emptyCount = 0;
 
@@ -385,13 +385,13 @@ void RPLidar::processDataTask(void* arg) {
                                         if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
                                             // Queue full, return batch to pool
                                             lidar->_batchPool->releaseBatch(currentBatch);
-                                            Serial.println("Queue full, batch dropped");
+                                            ESP_LOGV(TAG, "Queue full, batch dropped");
                                         }
                                         
                                         // Get new batch from pool
                                         currentBatch = lidar->_batchPool->acquireBatch();
                                         if (!currentBatch) {
-                                            Serial.println("Failed to acquire new batch from pool");
+                                            ESP_LOGV(TAG, "Failed to acquire new batch from pool");
                                             continue;
                                         } // end if
                                     } // end if
@@ -409,7 +409,7 @@ void RPLidar::processDataTask(void* arg) {
             emptyCount++;
             if(emptyCount > 1000) { // If no data for a while
                 emptyCount = 0;
-                Serial.println("No data received for a while");
+                ESP_LOGV(TAG, "No data received for a while");
             }
             vTaskDelay(xDelay);
         } // end of else
@@ -528,17 +528,17 @@ bool RPLidar::startExpressScan(uint8_t expressScanType) {
 	// Verify response descriptor
   if(expressScanType == EXPRESS_TYPE_LEGACY) {
     if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_LEGACY_SCAN, 84)) {
-			Serial.println("Response is of type RESP_TYPE_EXPRESS_LEGACY_SCAN");
+			ESP_LOGI(TAG, "Response is of type RESP_TYPE_EXPRESS_LEGACY_SCAN");
 			_scanResponseMode = RESP_TYPE_EXPRESS_LEGACY_SCAN;
 			return true;
     	} else if(verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_DENSE_SCAN, 84)) {
-			Serial.println("Response is of type RESP_TYPE_EXPRESS_DENSE_SCAN");
+			ESP_LOGI(TAG, "Response is of type RESP_TYPE_EXPRESS_DENSE_SCAN");
 			_scanResponseMode = RESP_TYPE_EXPRESS_DENSE_SCAN;
 			return true;
 	  	}
 	} else {
     	if (verifyResponseDescriptor(MULTI_RESP_MODE, RESP_TYPE_EXPRESS_EXTENDED_SCAN, 132)) {
-		    Serial.println("Response is of type RESP_TYPE_EXPRESS_EXTENDED_SCAN");
+		    ESP_LOGI(TAG, "Response is of type RESP_TYPE_EXPRESS_EXTENDED_SCAN");
           	_scanResponseMode = RESP_TYPE_EXPRESS_EXTENDED_SCAN;
           	return true;
     	}
@@ -558,14 +558,12 @@ bool RPLidar::forceScan() {
 }
 
 bool RPLidar::getHealth(DeviceHealth& health) {
-    //Serial.println("Requesting device health...");
     flushInput();
     
     sendCommand(CMD_GET_HEALTH);
-    //Serial.println("Health command sent, waiting for response...");
     
     if (!waitResponseHeader()) {
-        Serial.println("Failed to get health response header");
+        ESP_LOGE(TAG, "Failed to get health response header");
         return false;
     }
 
@@ -578,7 +576,7 @@ bool RPLidar::getHealth(DeviceHealth& health) {
     uint8_t buffer[3];
     size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
-        Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
+        ESP_LOGE(TAG, "Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
     }
     
@@ -589,14 +587,12 @@ bool RPLidar::getHealth(DeviceHealth& health) {
 }
 
 bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
-    //Serial.println("Requesting scan rate...");
     flushInput();
     
     sendCommand(GET_SAMPLERATE);
-    //Serial.println("SampleRate command sent, waiting for response...");
     
     if (!waitResponseHeader()) {
-        Serial.println("Failed to get health response header");
+        ESP_LOGE(TAG, "Failed to get health response header");
         return false;
     }
 	uint32_t expectedLength = 4; 
@@ -609,7 +605,7 @@ bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
     uint8_t buffer[expectedLength];
     size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
-        Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
+        ESP_LOGE(TAG, "Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
     }
     
@@ -620,14 +616,12 @@ bool RPLidar::getSampleRate(DeviceScanRate &scanRate) {
 }
 
 bool RPLidar::getInfo(DeviceInfo& info) {
-    //Serial.println("Requesting device info...");
     flushInput();
     
     sendCommand(CMD_GET_INFO);
-    //Serial.println("Info command sent, waiting for response...");
     
     if (!waitResponseHeader()) {
-        Serial.println("Failed to get info response header");
+        ESP_LOGE(TAG, "Failed to get info response header");
         return false;
     }
 
@@ -640,16 +634,9 @@ bool RPLidar::getInfo(DeviceInfo& info) {
     uint8_t buffer[20];
     size_t bytesRead = readBytes(buffer, _responseDescriptor.length);
     if (bytesRead != _responseDescriptor.length) {
-        Serial.printf("Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
+        ESP_LOGE(TAG, "Expected %lu bytes but got %d bytes\n", _responseDescriptor.length, bytesRead);
         return false;
     }
-    
-    /* Print raw bytes
-    Serial.print("Info raw data: ");
-    for (size_t i = 0; i < bytesRead; i++) {
-        Serial.printf("%02X ", buffer[i]);
-    }
-    Serial.println();*/
     
     // Parse according to reference implementation
     info.model = buffer[0];
@@ -697,7 +684,7 @@ sl_result RPLidar::_waitUltraCapsuledNode(sl_lidar_response_ultra_capsule_measur
 
 		size_t bytesRead = readBytes(recvBuffer, recvSize);
 		if(bytesRead < recvSize) {
-			Serial.println("Error: read less than available should not happen");
+			ESP_LOGE(TAG, "Error: read less than available should not happen");
 			continue;
 		}
 
@@ -904,7 +891,7 @@ sl_result RPLidar::readMeasurementTypeScan(MeasurementData* measurements, size_t
 			continue;
 		size_t bytesRead = readBytes(recvBuffer, sizeof(recvBuffer));
 		if(bytesRead < sizeof(recvBuffer)) {
-			Serial.println("Error: read less than available should not happen");
+			ESP_LOGE(TAG, "Error: read less than available should not happen");
 			continue;
 		}
 
@@ -1001,29 +988,24 @@ void RPLidar::sendCommand(uint8_t cmd, const uint8_t* payload, uint8_t payloadSi
 bool RPLidar::waitResponseHeader() {
     uint8_t byte;
     unsigned long startTime = millis();
-    
-    //Serial.println("Waiting for response header...");
-    
+        
     // Wait for first sync byte
     while ((millis() - startTime) < READ_TIMEOUT_MS*10) {
         if (available()) {
             byte = readByte();
-            //Serial.printf("Got byte: %02X\n", byte);
             if (byte == RESP_SYNC_BYTE1) {
-                //Serial.println("Found first sync byte");
                 
                 // Wait for second sync byte
                 startTime = millis();
                 while ((millis() - startTime) < READ_TIMEOUT_MS) {
                     if (available()) {
                         byte = readByte();
-                        //Serial.printf("Got second byte: %02X\n", byte);
                         if (byte == RESP_SYNC_BYTE2) {
                             // Read remaining 5 bytes of descriptor
                             uint8_t descriptor[5];
                             size_t bytesRead = readBytes(descriptor, 5);
                             if (bytesRead != 5) {
-                                Serial.println("Failed to read complete descriptor");
+                                ESP_LOGE(TAG, "Failed to read complete descriptor");
                                 return false;
                             }
 
@@ -1038,7 +1020,7 @@ bool RPLidar::waitResponseHeader() {
                             _responseDescriptor.mode = (lengthAndMode >> 30) & 0x03;
                             _responseDescriptor.dataType = descriptor[4];
 
-                            Serial.printf("Response descriptor: len=%lu mode=%u type=0x%02X\n", 
+                            ESP_LOGV(TAG, "Response descriptor: len=%lu mode=%u type=0x%02X\n", 
                                         _responseDescriptor.length, 
                                         _responseDescriptor.mode, 
                                         _responseDescriptor.dataType);
@@ -1047,28 +1029,28 @@ bool RPLidar::waitResponseHeader() {
                         }
                     }
                 }
-                Serial.println("Timeout waiting for second sync byte");
+                ESP_LOGE(TAG, "Timeout waiting for second sync byte");
                 return false;
             }
         }
     }
-    Serial.println("Timeout waiting for first sync byte");
+    ESP_LOGE(TAG, "Timeout waiting for first sync byte");
     return false;
 }
 
 bool RPLidar::verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedType, uint32_t expectedLength) {
     if (_responseDescriptor.mode != expectedMode) {
-        Serial.printf("Wrong response Mode: got 0x%02X, expected 0x%02X\n", 
+        ESP_LOGE(TAG, "Wrong response Mode: got 0x%02X, expected 0x%02X\n", 
                      _responseDescriptor.mode, expectedMode);
         return false;
     }
     if (_responseDescriptor.dataType != expectedType) {
-        Serial.printf("Wrong response type: got 0x%02X, expected 0x%02X\n", 
+        ESP_LOGE(TAG, "Wrong response type: got 0x%02X, expected 0x%02X\n", 
                      _responseDescriptor.dataType, expectedType);
         return false;
     }
     if (expectedLength != 0 && _responseDescriptor.length != expectedLength) {
-        Serial.printf("Wrong response length: got %lu, expected %lu\n", 
+        ESP_LOGE(TAG, "Wrong response length: got %lu, expected %lu\n", 
                      _responseDescriptor.length, expectedLength);
         return false;
     }
