@@ -65,9 +65,8 @@ RPLidar::RPLidar(uart_port_t lidarPortNum, int rxPin, int txPin, int motorPin, L
 }
 
 size_t RPLidar::calculateRecommendedPoolSize(
-    float lidarRotationHz,     // LIDAR rotation frequency
-    float processingTimeMs     // Expected processing time per batch
-) {
+    float lidarRotationHz,
+    float processingTimeMs) {
     float batchesInFlight = (lidarRotationHz * processingTimeMs / 1000.0);
     return ceil(batchesInFlight) + 1;  // Add 1 for buffer
 }
@@ -258,63 +257,32 @@ void RPLidar::uartRxTask(void* arg) {
 
 void RPLidar::processDataTask(void* arg) {
     ESP_LOGV(TAG, "Process task starting...");
-
-    // Give other tasks a chance to run
     vTaskDelay(pdMS_TO_TICKS(1));
 
     RPLidar* lidar = static_cast<RPLidar*>(arg);
-    if (!lidar) {
-        ESP_LOGE(TAG, "Invalid lidar pointer in process task");
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGV(TAG, "Checking ring buffer...");
-    if (!lidar->_uartRingBuf) {
-        ESP_LOGE(TAG, "Ring buffer not initialized");
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGV(TAG, "Checking batch pool...");
-    if (!lidar->_batchPool) {
-        ESP_LOGE(TAG, "Batch pool not initialized");
+    if (!lidar || !lidar->_uartRingBuf || !lidar->_batchPool || !lidar->publishQueue) {
+        ESP_LOGE(TAG, "Invalid initialization in process task");
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGV(TAG, "Checking for lidar->publishQueue");
-    if(!lidar->publishQueue) {
-        ESP_LOGE(TAG, "publishQueue not initialized");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // Allow some time for serial prints and other tasks
-    vTaskDelay(pdMS_TO_TICKS(1));
-    
-    ESP_LOGV(TAG, "Allocating temp buffer...");   
     uint8_t* tempBuffer = (uint8_t*)pvPortMalloc(sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t));
     if (!tempBuffer) {
         ESP_LOGE(TAG, "Failed to allocate temp buffer");
         vTaskDelete(NULL);
         return;
     }
-    size_t processPos = 0;
     
-    ESP_LOGV(TAG, "Getting initial batch...");
+    size_t processPos = 0;
     LaserScanBatch* currentBatch = lidar->_batchPool->acquireBatch();
     if (!currentBatch) {
-        ESP_LOGE(TAG, "Failed to acquire batch from pool");
+        ESP_LOGE(TAG, "Failed to acquire initial batch");
         vPortFree(tempBuffer);
         vTaskDelete(NULL);
         return;
     }
-    
-    ESP_LOGV(TAG, "Process task entering main loop");
-    const TickType_t xDelay = pdMS_TO_TICKS(1); // 10ms delay if no data
-    size_t emptyCount = 0;
 
+    size_t emptyCount = 0;
     while(1) {
         size_t itemSize;
         uint8_t* item = (uint8_t*)xRingbufferReceive(lidar->_uartRingBuf, &itemSize, pdMS_TO_TICKS(10));
@@ -347,9 +315,9 @@ void RPLidar::processDataTask(void* arg) {
                     }
                     default:
                         tempBuffer[processPos++] = currentByte;
-                        
                         // If we got a complete node (132 bytes) verify checksum.
                         if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
+
                             sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
                                 (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
                                 
@@ -363,11 +331,11 @@ void RPLidar::processDataTask(void* arg) {
                             processPos = 0;
                             //if checksum is ok extract measurementdata (96 measurements) from this node.
                             
-                            if(recvChecksum == checksum) {
+                            if(recvChecksum == checksum) {                                
                                 MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
                                 size_t count = 0;
                                 lidar->ultraCapsuleToNormal(*node, measurements, count);
-                                
+       
                                 for(size_t i = 0; i < count; i++) {
                                     // First, add the measurement. not sure what currentBatch->max_measurements is for 
                                     if(currentBatch->total_measurements < currentBatch->max_measurements) {
@@ -381,22 +349,22 @@ void RPLidar::processDataTask(void* arg) {
                                         
                                     // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
                                     // When batch is full:
-                                    if(currentBatch->total_rotations >= 1) {
+                                    if(currentBatch->total_rotations >= 1 
+                                            || currentBatch->total_measurements >= currentBatch->max_measurements) {
                                         if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
-                                            // Queue full, return batch to pool
-                                            lidar->_batchPool->releaseBatch(currentBatch);
                                             ESP_LOGV(TAG, "Queue full, batch dropped");
                                         }
-                                        
-                                        // Get new batch from pool
+                                        // Always get new batch - the ring buffer will handle overwriting old data
                                         currentBatch = lidar->_batchPool->acquireBatch();
                                         if (!currentBatch) {
-                                            ESP_LOGV(TAG, "Failed to acquire new batch from pool");
-                                            continue;
-                                        } // end if
-                                    } // end if
+                                            ESP_LOGE(TAG, "Failed to acquire batch - this should never happen with ring buffer");
+                                            vPortFree(tempBuffer);
+                                            vTaskDelete(NULL);
+                                            return;
+                                        }
+                                    }
                                 } // end for
-						    } // end if
+                            } // end if
                         } // end if(processPos
                         break;
 
@@ -411,7 +379,7 @@ void RPLidar::processDataTask(void* arg) {
                 emptyCount = 0;
                 ESP_LOGV(TAG, "No data received for a while");
             }
-            vTaskDelay(xDelay);
+            vTaskDelay(pdMS_TO_TICKS(10));
         } // end of else
         // Add an explicit yield every few iterations
         taskYIELD();

@@ -1,8 +1,8 @@
-#include "FixedLaserScanBatchPool.h"
+#include "RingLaserScanBatchPool.h"
 #include "RPLidar.h"
 
 // Declare as pointers instead of objects
-FixedLaserScanBatchPool* batchPool = nullptr;
+RingLaserScanBatchPool* batchPool = nullptr;
 RPLidar* lidar = nullptr;
 TaskHandle_t publishTaskHandle = NULL;
 bool scanning = false;
@@ -74,9 +74,9 @@ void startLidarScan() {
     delay(2000);  // Give it time to reset
     
     // Start motor with a clean delay sequence
-    Serial.println("Starting motor...");
-    lidar->startMotor();
-    delay(1000);  // Give motor time to reach speed
+    //Serial.println("Starting motor...");
+    //lidar->startMotor();
+    //delay(1000);  // Give motor time to reach speed
 
     // Start scan
     Serial.println("Starting scan...");
@@ -101,9 +101,10 @@ void setup() {
         delay(100);
     }
     Serial.println("Starting initialization...");
+    Serial.printf("Current core: %d, other core: %d\n", xPortGetCoreID(), !xPortGetCoreID());
     
     // Create batch pool first
-    batchPool = new FixedLaserScanBatchPool(10);
+    batchPool = new RingLaserScanBatchPool(10);
     if (!batchPool) {
         Serial.println("Failed to create batch pool");
         return;
@@ -166,28 +167,28 @@ void publishTask(void* arg) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     BaseType_t xWasDelayed;
 
+    Serial.println("Publish task started.");
     startMs = millis();
     startmillis = millis();
+    scanning = true;
     while(lidar->publishQueue == NULL) {
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
     while(1) {
         LaserScanBatch* batchToPublish;
-        if(lidar->publishQueue == NULL) vTaskDelete(NULL);
 
-        if(xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
-            //test some delays
-            xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
-            delayMs += xWasDelayed;
+        xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+        delayMs += xWasDelayed;
+        if(lidar->publishQueue != NULL && xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
 
             totalMeasurements += batchToPublish->total_measurements;
             totalRotations += batchToPublish->total_rotations;
             totalMessages++;
             
             if(totalMessages >= 120) {
-                Serial.printf("Published: %d, pubs (ms): %.0f, mes/rot: %.1f, "
-                            "Measurements: %d, Rate: %.0f measurements/s,"
-                            "Free queue space: %d, Delays(ms): %d\n",
+                Serial.printf("%d, pubs (ms): %.0f, mes/rot: %.1f, "
+                            "Measurements: %d, Rate: %.0f meas/s,"
+                            "Free queue space: %d,  Num of Delays: %d\n",
                     totalMessages,
                     1.0*(millis() - startMs)/totalMessages,
                     1.0*totalMeasurements/totalRotations,
@@ -202,22 +203,23 @@ void publishTask(void* arg) {
                 delayMs = 0;
                 startMs = millis();
             }
-            // Return batch to pool instead of freeing
-            batchPool->releaseBatch(batchToPublish);
         }
-        /* start & stop every minute
+        // start & stop every minute
         if (scanning && (millis() - startmillis) > 1 * 60 * 1000) {
             lidar->stopScan();
-                scanning = false;
+            scanning = false;
             Serial.printf("Scan stopped at %d ms\n", millis());
-        } else if (!scanning && (millis() - startmillis) > 2 * 60 * 1000) {
+        } else if (!scanning && (millis() - startmillis) > 1.5 * 60 * 1000) {
             if (lidar->startExpressScan()) {
                 scanning = true;
                 startmillis = millis();
     		        Serial.println("Scan restarted successfully.");
-		        }
-        }*/
+		        } else {
+              Serial.println("Failed to restart scan.");
+            }
+        }
     }
+    Serial.println("Out of while");
 }
 
 void loop() {
