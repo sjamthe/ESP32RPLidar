@@ -1,4 +1,6 @@
 
+#include <stdlib.h>
+#include <HardwareSerial.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 
@@ -22,6 +24,10 @@ static struct micro_ros_agent_locator locator;
 rcl_allocator_t allocator;
 rclc_support_t support;
 rcl_node_t node;
+rcl_publisher_t scan_publisher;
+std_msgs__msg__String scanMsg;
+static bool scan_publisher_status = false;
+static unsigned long last_successful_publish = 0;
 
 //Lidar variables
 #include "RingLaserScanBatchPool.h"
@@ -172,6 +178,31 @@ void setupMicroROS() {
 
 }
 
+void initScanPublisher() {
+	scan_publisher = rcl_get_zero_initialized_publisher();
+	//last_scan_publisher_create = millis();
+
+	// get & set options, this ensures publisher doesn't return errors(1), just does best effort. we get 10qps
+	rmw_qos_profile_t publisher_qos = rmw_qos_profile_default;
+	publisher_qos.reliability = RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT;
+	publisher_qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+
+	rcl_ret_t retval = rclc_publisher_init(
+		&scan_publisher,
+		&node,
+		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+    	"scan",
+		&publisher_qos);
+	if(retval != RCL_RET_OK) {
+		Serial.printf("Error(%d) creating scan publisher. %s",retval, rcutils_get_error_string().str);
+		scan_publisher_status = false;
+		rcl_reset_error();
+		return;
+	}
+	scan_publisher_status = true;
+	Serial.printf("MicroROS publishing /scan topic now.");
+}
+
 bool getLidarInfo() {
 // Get device info
     RPLidar::DeviceInfo info;
@@ -233,6 +264,125 @@ void setupLidar() {
 	}
 }
 
+void publishMessage(char* buffer) {
+	scanMsg.data.data = buffer;
+	scanMsg.data.size = strlen(scanMsg.data.data);
+	scanMsg.data.capacity = strlen(scanMsg.data.data);
+    
+	rcl_ret_t retval = rcl_publish(&scan_publisher, &scanMsg, NULL);
+
+	//With the new best effort policy we din't get errors even if ros-agent is down.
+	if(retval == RCL_RET_OK) {
+		last_successful_publish = millis();
+	} else {
+		static unsigned long gap = millis() - last_successful_publish;
+		Serial.printf("Error(%d) publishing scan., gap=%u, %s",retval, gap, rcl_get_error_string());
+		rcl_reset_error();
+		return;
+	}
+}
+
+void createPublishTask() {
+    if (publishTaskHandle == NULL) {
+        BaseType_t result = xTaskCreatePinnedToCore(
+            publishTask,
+            "publish",
+            8192,  // Increased stack size
+            NULL,
+            4, // priority
+            &publishTaskHandle,
+            1 // core
+        );
+        if (result != pdPASS) {
+            Serial.println("Failed to create publish task");
+            scanning = false;
+            return;
+        }
+        scanning = true;
+        Serial.println("Publish task created successfully");
+    }
+}
+
+void publishTask(void* arg) {
+    //RPLidar* lidar = static_cast<RPLidar*>(arg);
+    static unsigned long totalMeasurements = 0;
+    static unsigned long totalRotations = 0;
+    static unsigned long totalMessages = 0;
+    unsigned long startMs = 0;
+    unsigned long delayMs = 0;
+    unsigned long startmillis = 0;
+
+    const TickType_t xFrequency = pdMS_TO_TICKS(80);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    BaseType_t xWasDelayed;
+
+    Serial.println("Publish task started.");
+    startMs = millis();
+    startmillis = millis();
+    scanning = true;
+    while(lidar->publishQueue == NULL) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    while(1) {
+        LaserScanBatch* batchToPublish;
+
+        xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+        delayMs += xWasDelayed;
+        if(lidar->publishQueue != NULL && xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
+
+            char buffer[256];
+            sprintf(buffer,"measurements %d, rotations %d", batchToPublish->total_measurements, batchToPublish->total_rotations);
+            publishMessage(buffer);
+
+            totalMeasurements += batchToPublish->total_measurements;
+            totalRotations += batchToPublish->total_rotations;
+            totalMessages++;
+            
+            if(totalMessages >= 120) {
+                Serial.printf("%d, pubs (ms): %.0f, mes/rot: %.1f, "
+                            "Measurements: %d, Rate: %.0f meas/s,"
+                            "Free queue space: %d,  Num of Delays: %d\n",
+                    totalMessages,
+                    1.0*(millis() - startMs)/totalMessages,
+                    1.0*totalMeasurements/totalRotations,
+                    totalMeasurements,
+                    1000.0 * totalMeasurements / (millis() - startMs),
+                    uxQueueSpacesAvailable(lidar->publishQueue),
+                    delayMs);
+
+                totalMeasurements = 0;
+                totalRotations = 0;
+                totalMessages = 0;
+                delayMs = 0;
+                startMs = millis();
+            }
+        }
+    }
+    Serial.println("Out of while");
+}
+
+void startLidarScan() {
+        // Reset device before starting
+    Serial.println("Resetting RPLidar...");
+    lidar->resetLidar();
+    delay(2000);  // Give it time to reset
+
+    // Start scan
+    Serial.println("Starting scan...");
+    
+    if (!lidar->startExpressScan()) {
+        Serial.println("Failed to start scan");
+        scanning = false;
+        delay(1000);  
+        return;
+    }
+    Serial.println("Scan started successfully");
+    createPublishTask();
+
+    // Wait for measurements to start
+    delay(200);
+}
+
 void setup() {
 
 	Serial.begin(115200);
@@ -244,8 +394,11 @@ void setup() {
 
 	setupMicroROS();
 	setupLidar();
+    initScanPublisher();
+    startLidarScan();
 }
 
 void loop() {
-
+    //publishMessage("Hello there!");
+    //vTaskDelay(pdMS_TO_TICKS(100));
 }
