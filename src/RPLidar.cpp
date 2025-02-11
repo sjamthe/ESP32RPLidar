@@ -298,78 +298,94 @@ void RPLidar::processDataTask(void* arg) {
                     case 0: {
                         uint8_t tmp = (currentByte >> 4);
                         if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_1) {
+                            lidar->_is_previous_capsuledataRdy = false;
                             continue;
                         }
-                        tempBuffer[processPos++] = currentByte;
                         break;
                     }
                     case 1: {
                         uint8_t tmp = (currentByte >> 4);
                         if(tmp != RPLIDAR_RESP_MEASUREMENT_EXP_SYNC_2) {
                             processPos = 0;
+                            lidar->_is_previous_capsuledataRdy = false;
                             continue;
                         }
-                        tempBuffer[processPos++] = currentByte;
                         break;
                     }
                     default:
-                        tempBuffer[processPos++] = currentByte;
-                        // If we got a complete node (132 bytes) verify checksum.
-                        if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
-
-                            sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
-                                (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
-                                
-                            uint8_t checksum = 0;
-                            uint8_t recvChecksum = ((node->s_checksum_1 & 0xF) | (node->s_checksum_2 << 4));
-                            
-                            for(size_t cpos = offsetof(sl_lidar_response_ultra_capsule_measurement_nodes_t, start_angle_sync_q6);
-                                cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos) {
-                                checksum ^= tempBuffer[cpos];
-                            }
-                            processPos = 0;
-                            //if checksum is ok extract measurementdata (96 measurements) from this node.
-                            
-                            if(recvChecksum == checksum) {                                
-                                MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
-                                size_t count = 0;
-                                lidar->ultraCapsuleToNormal(*node, measurements, count);
-       
-                                for(size_t i = 0; i < count; i++) {
-                                    // First, add the measurement. not sure what currentBatch->max_measurements is for 
-                                    if(currentBatch->total_measurements < currentBatch->max_measurements) {
-                                        currentBatch->measurements[currentBatch->total_measurements++] = measurements[i];
-                                    }
-                                    
-                                    // Then check if it's a start flag
-                                    if(measurements[i].startFlag) {
-                                        currentBatch->total_rotations++;
-                                    }
-                                        
-                                    // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
-                                    // When batch is full:
-                                    if(currentBatch->total_rotations >= 1 
-                                            || currentBatch->total_measurements >= currentBatch->max_measurements) {
-                                        if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
-                                            ESP_LOGV(TAG, "Queue full, batch dropped");
-                                        }
-                                        // Always get new batch - the ring buffer will handle overwriting old data
-                                        currentBatch = lidar->_batchPool->acquireBatch();
-                                        if (!currentBatch) {
-                                            ESP_LOGE(TAG, "Failed to acquire batch - this should never happen with ring buffer");
-                                            vPortFree(tempBuffer);
-                                            vTaskDelete(NULL);
-                                            return;
-                                        }
-                                    }
-                                } // end for
-                            } // end if
-                        } // end if(processPos
                         break;
+                }
+                tempBuffer[processPos++] = currentByte;
+                // If we got a complete node (132 bytes) verify checksum.
+                if(processPos == sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t)) {
 
-                } // end switch
+                    sl_lidar_response_ultra_capsule_measurement_nodes_t* node = 
+                        (sl_lidar_response_ultra_capsule_measurement_nodes_t*)tempBuffer;
+                        
+                    uint8_t checksum = 0;
+                    uint8_t recvChecksum = ((node->s_checksum_1 & 0xF) | (node->s_checksum_2 << 4));
+                    
+                    for(size_t cpos = offsetof(sl_lidar_response_ultra_capsule_measurement_nodes_t, start_angle_sync_q6);
+                        cpos < sizeof(sl_lidar_response_ultra_capsule_measurement_nodes_t); ++cpos) {
+                        checksum ^= tempBuffer[cpos];
+                    }
+                    processPos = 0;
+                    //if checksum is ok extract measurementdata (96 measurements) from this node.
+                    
+                    if(recvChecksum == checksum) {
+                        if (node->start_angle_sync_q6 & RPLIDAR_RESP_MEASUREMENT_EXP_SYNCBIT) {
+                            lidar->_is_previous_capsuledataRdy = false;
+                        }                              
+                        MeasurementData measurements[lidar->EXPRESS_MEASUREMENTS_PER_SCAN];
+                        size_t count = 0;
+                        lidar->ultraCapsuleToNormal(*node, measurements, count);
+                        float prevAngle = -1;
+                        for(size_t i = 0; i < count; i++) {
+                            // First, add the measurement. not sure what currentBatch->max_measurements is for 
+                            if(currentBatch->total_measurements < currentBatch->max_measurements) {
+                                // If a new rotation is starting then send currentBatch
+                                if((prevAngle - measurements[i].angle) > 300) {
+                                    if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
+                                        lidar->_is_previous_capsuledataRdy = false;
+                                        ESP_LOGV(TAG, "Queue full, batch dropped");
+                                    }
+                                    // Always get new batch - the ring buffer will handle overwriting old data
+                                    currentBatch = lidar->_batchPool->acquireBatch();
+                                } 
+                                prevAngle = measurements[i].angle;
+                                currentBatch->measurements[currentBatch->total_measurements++] = measurements[i];
+                                // Then check if it's a start flag
+                                if(measurements[i].startFlag) {
+                                    currentBatch->total_rotations++;
+                                }                            
+                            }  else {
+                                // We may get here is angle is wrong. get rig of barch and start again.
+                                lidar->_is_previous_capsuledataRdy = false;
+                                currentBatch = lidar->_batchPool->acquireBatch();
+                            }   
+                            // Check if we have enough measurements (roughly SCANS_PER_PUBLISH)
+                            // When batch is full:
+                            /*if(currentBatch->total_rotations >= 1 
+                                    || currentBatch->total_measurements >= currentBatch->max_measurements) {
+                                if(xQueueSend(lidar->publishQueue, &currentBatch, 0) != pdTRUE) {
+                                    lidar->_is_previous_capsuledataRdy = false;
+                                    ESP_LOGV(TAG, "Queue full, batch dropped");
+                                }
+                                // Always get new batch - the ring buffer will handle overwriting old data
+                                currentBatch = lidar->_batchPool->acquireBatch();
+                                if (!currentBatch) {
+                                    ESP_LOGE(TAG, "Failed to acquire batch - this should never happen with ring buffer");
+                                    vPortFree(tempBuffer);
+                                    vTaskDelete(NULL);
+                                    return;
+                                }
+                            }*/
+                        } // end for
+                    } else { // bad checksum
+                        lidar->_is_previous_capsuledataRdy = false;
+                    } // end if
+                } // end if(processPos
             } // end of for
-            
             vRingbufferReturnItem(lidar->_uartRingBuf, item);
             emptyCount = 0;
         }  else {
