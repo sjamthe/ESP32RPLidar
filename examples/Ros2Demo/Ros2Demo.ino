@@ -301,8 +301,13 @@ void publishMessage(char* buffer) {
 
 int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long scan_time_us) {
     const int maxCount = 50; // Limit because of memory limitation in transport layer.
+    char frameId[50];
+    float intensities[maxCount]; // static allocation
+    float ranges[maxCount];
 
-    Serial.printf("size %d, time_ns %lld, scan_time %d\n",batchToPublish->total_measurements,time_ns, scan_time_us);
+    strcpy(frameId, FRAME_ID);
+
+    //Serial.printf("size %d, time_ns %lld, scan_time %d\n",batchToPublish->total_measurements,time_ns, scan_time_us);
     //size_t totalMeasurments = batchToPublish->total_measurements;
     if (batchToPublish->total_measurements <= 1) {
         Serial.println("Error: Invalid measurement count");
@@ -321,21 +326,21 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         if((start + 1) * maxCount >= batchToPublish->total_measurements ) {
             //Last incomplete chunk
             count = batchToPublish->total_measurements - start * maxCount;
-            Serial.printf("count:%d, numOfChunks: %d, batchToPublish->total_measurements: %d\n",count, numOfChunks, batchToPublish->total_measurements);
         }
+        Serial.printf("count:%d, numOfChunks: %d, batchToPublish->total_measurements: %d\n",count, numOfChunks, batchToPublish->total_measurements);
         
         sensor_msgs__msg__LaserScan scanMsg;
-        scanMsg.header.frame_id.data = (char *) malloc(strlen(FRAME_ID) + 1);
-        if (scanMsg.header.frame_id.data == NULL) {
+        scanMsg.header.frame_id.data = frameId; //(char *) malloc(strlen(FRAME_ID) + 1);
+        /*if (scanMsg.header.frame_id.data == NULL) {
             Serial.println("Failed to allocate frame_id memory");
             return RCL_RET_ERROR;
         }
-        strcpy(scanMsg.header.frame_id.data, FRAME_ID);
+        strcpy(scanMsg.header.frame_id.data, FRAME_ID);*/
         scanMsg.header.frame_id.size = strlen(scanMsg.header.frame_id.data);
         scanMsg.header.frame_id.capacity = strlen(scanMsg.header.frame_id.data);
 
         int64_t chunck_time_ns = time_ns + start*scan_time_us*1000;
-        printf("chunck_time_ns: %" PRId64 "\n", chunck_time_ns);
+        //printf("chunck_time_ns: %" PRId64 "\n", chunck_time_ns);
 
         int64_t time_secs = chunck_time_ns / 1000000000LL;
         //printf("time_secs (int64_t): %" PRId64 "\n", time_secs);
@@ -345,13 +350,13 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         scanMsg.header.stamp.sec = sec;
         scanMsg.header.stamp.nanosec = (uint32_t)(chunck_time_ns % 1000000000LL);
 
-        scanMsg.angle_min = batchToPublish->measurements[start*maxCount].angle*2.0*M_PI/360.0;
-        scanMsg.angle_max = batchToPublish->measurements[start*maxCount + count -1].angle*2.0*M_PI/360.0;
+        scanMsg.angle_min = batchToPublish->measurements[start*maxCount].angle*M_PI/180.0;
+        scanMsg.angle_max = batchToPublish->measurements[start*maxCount + count -1].angle*M_PI/180.0;
         scanMsg.angle_increment = (scanMsg.angle_max - scanMsg.angle_min) / (double)(count);
-        /*Serial.printf("start %d, last %d, angle_min: %f, angle_max: %f, count: %d\n", 
+        Serial.printf("start %d, last %d, angle_min: %f, angle_max: %f, count: %d\n", 
                 start*maxCount,
                 (start*maxCount + count -1),
-                scanMsg.angle_min, scanMsg.angle_max, count);*/
+                scanMsg.angle_min, scanMsg.angle_max, count);
 
         scanMsg.scan_time = scan_time_us/1000000.0;
         scanMsg.time_increment = scanMsg.scan_time / (double)(count);
@@ -363,28 +368,34 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         scanMsg.ranges.size = count;
         scanMsg.ranges.capacity = count;
 
-        scanMsg.intensities.data = (float*) malloc(scanMsg.intensities.capacity * sizeof(float));
-        scanMsg.ranges.data = (float*) malloc(scanMsg.ranges.capacity * sizeof(float));
+        //scanMsg.intensities.data = (float*) malloc(scanMsg.intensities.capacity * sizeof(float));
+        scanMsg.intensities.data = intensities;
+        //scanMsg.ranges.data = (float*) malloc(scanMsg.ranges.capacity * sizeof(float));
+        scanMsg.ranges.data = ranges;
         if (scanMsg.intensities.data == NULL || scanMsg.ranges.data == NULL) {
-            free(scanMsg.header.frame_id.data);
-            if (scanMsg.intensities.data) free(scanMsg.intensities.data);
-            if (scanMsg.ranges.data) free(scanMsg.ranges.data);
+            //free(scanMsg.header.frame_id.data);
+            //if (scanMsg.intensities.data) free(scanMsg.intensities.data);
+            //if (scanMsg.ranges.data) free(scanMsg.ranges.data);
             Serial.printf("Failed to allocate data arrays for count %d\n", count);
             return RCL_RET_ERROR;
         }
-        //Serial.println("malloc worked");
-
+        
         for (size_t i = 0; i < count; i++) {
-            float readValue = batchToPublish->measurements[i].distance/1000.0;
+            Serial.printf("before range.data %d\n", i);
+            if(i >= batchToPublish->total_measurements) {
+                Serial.printf("Too high i\n");
+                break;
+            }
+            float readValue = batchToPublish->measurements[start*maxCount + i].distance/1000.0;
             if(readValue == 0.0) {
                 scanMsg.ranges.data[i] = std::numeric_limits<float>::infinity();
             } else {
                 scanMsg.ranges.data[i] = readValue;
             }
-            scanMsg.ranges.data[i] = readValue;
+            //scanMsg.ranges.data[i] = readValue;
             scanMsg.intensities.data[i] = batchToPublish->measurements[i].quality;
         }
-        //Serial.println("before return");
+        Serial.println("before publish");
         rcl_ret_t retval = rcl_publish(&scan_publisher, &scanMsg, NULL);
         //With the new best effort policy we din't get errors even if ros-agent is down.
         if(retval != RCL_RET_OK) {
@@ -396,15 +407,15 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
                 Serial.printf("%d:%f,%f\n",i,scanMsg.ranges.data[i], scanMsg.intensities.data[i]);
             }*/
             rcl_reset_error();
-            free(scanMsg.header.frame_id.data);
-            free(scanMsg.intensities.data);
-            free(scanMsg.ranges.data);  
+            //free(scanMsg.header.frame_id.data);
+            //free(scanMsg.intensities.data);
+            //free(scanMsg.ranges.data);  
             return retval;  
         }
         // Clean up allocated memory
-        free(scanMsg.header.frame_id.data);
-        free(scanMsg.intensities.data);
-        free(scanMsg.ranges.data);
+        //free(scanMsg.header.frame_id.data);
+        //free(scanMsg.intensities.data);
+        //free(scanMsg.ranges.data);
     }
     return RCL_RET_OK;
 }
