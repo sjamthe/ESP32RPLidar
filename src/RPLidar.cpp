@@ -351,6 +351,8 @@ void RPLidar::processDataTask(void* arg) {
                                     }
                                     // Always get new batch - the ring buffer will handle overwriting old data
                                     currentBatch = lidar->_batchPool->acquireBatch();
+                                    //Serial.printf("Acquired batch %d, free queue %d\n", lidar->_batchPool->getCurrentIndex(),
+                                    //        uxQueueSpacesAvailable(lidar->publishQueue));
                                 } 
                                 prevAngle = measurements[i].angle;
                                 currentBatch->measurements[currentBatch->total_measurements++] = measurements[i];
@@ -359,7 +361,7 @@ void RPLidar::processDataTask(void* arg) {
                                     currentBatch->total_rotations++;
                                 }                            
                             }  else {
-                                // We may get here is angle is wrong. get rig of barch and start again.
+                                // We may get here if angle is wrong. get rid of current batch and start again.
                                 lidar->_is_previous_capsuledataRdy = false;
                                 currentBatch = lidar->_batchPool->acquireBatch();
                             }   

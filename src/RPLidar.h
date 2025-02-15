@@ -39,6 +39,7 @@ struct LaserScanBatchPool {
     virtual LaserScanBatch* acquireBatch() = 0;
     virtual void releaseBatch(LaserScanBatch* batch) = 0;
     virtual size_t getNumOfBatches() const = 0;
+    virtual size_t getCurrentIndex() const = 0;
 };
 
 typedef uint32_t sl_result;

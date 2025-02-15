@@ -1,12 +1,3 @@
-/*
-#if CONFIG_FREERTOS_UNICORE
-#define ARDUINO_RUNNING_CORE 0
-#else
-#define ARDUINO_RUNNING_CORE 1
-#endif
-// Increase stack size for the Arduino loop task
-SET_LOOP_TASK_STACK_SIZE(16*1024); // 16KB stack
-*/
 #include <string.h>
 #include <HardwareSerial.h>
 #include <WiFi.h>
@@ -198,9 +189,11 @@ void initScanPublisher() {
 	//last_scan_publisher_create = millis();
 
 	// get & set options, this ensures publisher doesn't return errors(1), just does best effort. we get 10qps
-	rmw_qos_profile_t publisher_qos = rmw_qos_profile_default;
+	rmw_qos_profile_t publisher_qos = rmw_qos_profile_sensor_data;
 	publisher_qos.reliability = RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT;
-	publisher_qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+    publisher_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    publisher_qos.depth = 1;
+	//publisher_qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
 
 	rcl_ret_t retval = rclc_publisher_init(
 		&scan_publisher,
@@ -300,15 +293,13 @@ void publishMessage(char* buffer) {
 }
 
 int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long scan_time_us) {
-    const int maxCount = 50; // Limit because of memory limitation in transport layer.
+    const int maxCount = 55; // Limit because of MTU memory limitation in transport layer. (UXR_CONFIG_UDP_TRANSPORT_MTU = 512b)
     char frameId[50];
     float intensities[maxCount]; // static allocation
     float ranges[maxCount];
 
     strcpy(frameId, FRAME_ID);
 
-    //Serial.printf("size %d, time_ns %lld, scan_time %d\n",batchToPublish->total_measurements,time_ns, scan_time_us);
-    //size_t totalMeasurments = batchToPublish->total_measurements;
     if (batchToPublish->total_measurements <= 1) {
         Serial.println("Error: Invalid measurement count");
         return RCL_RET_ERROR;
@@ -316,9 +307,9 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
 
     int numOfChunks = int(batchToPublish->total_measurements / maxCount);
     //round up if necessary.
+    //Serial.printf("Entering: numOfChunks: %d, batchToPublish->total_measurements: %d\n",
+    //                    numOfChunks, batchToPublish->total_measurements);
     if(batchToPublish->total_measurements > numOfChunks * maxCount) numOfChunks++;
-    //Change scan_time to per chunk.
-    scan_time_us = scan_time_us / numOfChunks;
 
     for (int start=0; start<numOfChunks; start++) {
         
@@ -327,19 +318,20 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
             //Last incomplete chunk
             count = batchToPublish->total_measurements - start * maxCount;
         }
-        Serial.printf("count:%d, numOfChunks: %d, batchToPublish->total_measurements: %d\n",count, numOfChunks, batchToPublish->total_measurements);
-        
-        sensor_msgs__msg__LaserScan scanMsg;
-        scanMsg.header.frame_id.data = frameId; //(char *) malloc(strlen(FRAME_ID) + 1);
-        /*if (scanMsg.header.frame_id.data == NULL) {
-            Serial.println("Failed to allocate frame_id memory");
+        if(count < 0) {
+            Serial.printf("Error: start %d, count:%d, numOfChunks: %d, batchToPublish->total_measurements: %d\n",
+                        start, count, numOfChunks, batchToPublish->total_measurements);
             return RCL_RET_ERROR;
         }
-        strcpy(scanMsg.header.frame_id.data, FRAME_ID);*/
+        sensor_msgs__msg__LaserScan scanMsg;
+        scanMsg.header.frame_id.data = frameId;
         scanMsg.header.frame_id.size = strlen(scanMsg.header.frame_id.data);
         scanMsg.header.frame_id.capacity = strlen(scanMsg.header.frame_id.data);
 
-        int64_t chunck_time_ns = time_ns + start*scan_time_us*1000;
+        //What if we have same start time for all, and don't modify scan_time_us?
+        //int64_t chunck_time_ns = time_ns + start*scan_time_us*1000;
+        scan_time_us = scan_time_us / numOfChunks;
+        int64_t chunck_time_ns = time_ns;
         //printf("chunck_time_ns: %" PRId64 "\n", chunck_time_ns);
 
         int64_t time_secs = chunck_time_ns / 1000000000LL;
@@ -353,11 +345,11 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         scanMsg.angle_min = batchToPublish->measurements[start*maxCount].angle*M_PI/180.0;
         scanMsg.angle_max = batchToPublish->measurements[start*maxCount + count -1].angle*M_PI/180.0;
         scanMsg.angle_increment = (scanMsg.angle_max - scanMsg.angle_min) / (double)(count);
-        Serial.printf("start %d, last %d, angle_min: %f, angle_max: %f, count: %d\n", 
+        /*Serial.printf("start %d, last %d, angle_min: %f, angle_max: %f, count: %d\n", 
                 start*maxCount,
                 (start*maxCount + count -1),
                 scanMsg.angle_min, scanMsg.angle_max, count);
-
+        */
         scanMsg.scan_time = scan_time_us/1000000.0;
         scanMsg.time_increment = scanMsg.scan_time / (double)(count);
         scanMsg.range_min = 0.05; // in meters
@@ -368,22 +360,16 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         scanMsg.ranges.size = count;
         scanMsg.ranges.capacity = count;
 
-        //scanMsg.intensities.data = (float*) malloc(scanMsg.intensities.capacity * sizeof(float));
         scanMsg.intensities.data = intensities;
-        //scanMsg.ranges.data = (float*) malloc(scanMsg.ranges.capacity * sizeof(float));
         scanMsg.ranges.data = ranges;
         if (scanMsg.intensities.data == NULL || scanMsg.ranges.data == NULL) {
-            //free(scanMsg.header.frame_id.data);
-            //if (scanMsg.intensities.data) free(scanMsg.intensities.data);
-            //if (scanMsg.ranges.data) free(scanMsg.ranges.data);
             Serial.printf("Failed to allocate data arrays for count %d\n", count);
             return RCL_RET_ERROR;
         }
         
         for (size_t i = 0; i < count; i++) {
-            Serial.printf("before range.data %d\n", i);
             if(i >= batchToPublish->total_measurements) {
-                Serial.printf("Too high i\n");
+                Serial.printf("Too high i:%d, batchToPublish->total_measurements:%d\n",i, batchToPublish->total_measurements);
                 break;
             }
             float readValue = batchToPublish->measurements[start*maxCount + i].distance/1000.0;
@@ -392,30 +378,17 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
             } else {
                 scanMsg.ranges.data[i] = readValue;
             }
-            //scanMsg.ranges.data[i] = readValue;
             scanMsg.intensities.data[i] = batchToPublish->measurements[i].quality;
         }
-        Serial.println("before publish");
         rcl_ret_t retval = rcl_publish(&scan_publisher, &scanMsg, NULL);
         //With the new best effort policy we din't get errors even if ros-agent is down.
         if(retval != RCL_RET_OK) {
-            //static unsigned long gap = millis() - last_successful_publish;
             Serial.printf("Error(%d) publishing scan for range.size %d\n",retval, scanMsg.ranges.size);
             Serial.printf("angle_min: %f, angle_max: %f, count: %d\n", 
                 scanMsg.angle_min, scanMsg.angle_max, count);
-            /*for(int i=0; i<scanMsg.ranges.size; i++) {
-                Serial.printf("%d:%f,%f\n",i,scanMsg.ranges.data[i], scanMsg.intensities.data[i]);
-            }*/
             rcl_reset_error();
-            //free(scanMsg.header.frame_id.data);
-            //free(scanMsg.intensities.data);
-            //free(scanMsg.ranges.data);  
             return retval;  
         }
-        // Clean up allocated memory
-        //free(scanMsg.header.frame_id.data);
-        //free(scanMsg.intensities.data);
-        //free(scanMsg.ranges.data);
     }
     return RCL_RET_OK;
 }
@@ -425,7 +398,7 @@ void createPublishTask() {
         BaseType_t result = xTaskCreatePinnedToCore(
             publishTask,
             "publish",
-            8192,  // Increased stack size
+            (1024*9),  // Increased stack size
             NULL,
             4, // priority
             &publishTaskHandle,
@@ -441,8 +414,24 @@ void createPublishTask() {
     }
 }
 
+// Function to copy into statically allocated memory
+void copyLaserScanBatch(struct LaserScanBatch* dest, const struct LaserScanBatch* source) {
+    
+    // Copy measurement data
+    memcpy(dest->measurements, source->measurements, 
+           source->total_measurements * sizeof(struct MeasurementData));
+    
+    // Copy other fields
+    dest->max_measurements = source->max_measurements;
+    dest->total_measurements = source->total_measurements;
+    dest->total_rotations = source->total_rotations;
+}
+
 void publishTask(void* arg) {
-    //RPLidar* lidar = static_cast<RPLidar*>(arg);
+    struct LaserScanBatch currentBatch; // static
+    static struct MeasurementData static_measurements[MAX_MEASUREMENTS_PER_BATCH];
+    currentBatch.measurements = static_measurements;
+
     static unsigned long totalMeasurements = 0;
     static unsigned long totalRotations = 0;
     static unsigned long totalMessages = 0;
@@ -450,7 +439,7 @@ void publishTask(void* arg) {
     unsigned long delayMs = 0;
     unsigned long startmillis = 0;
 
-    const TickType_t xFrequency = pdMS_TO_TICKS(80);
+    const TickType_t xFrequency = pdMS_TO_TICKS(40);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     BaseType_t xWasDelayed;
 
@@ -462,6 +451,7 @@ void publishTask(void* arg) {
     while(lidar->publishQueue == NULL) {
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
+    int minFreePool = uxQueueSpacesAvailable(lidar->publishQueue);
     int64_t time_ns = rmw_uros_epoch_nanos();
     unsigned long startMicros = micros();
     while(1) {
@@ -470,44 +460,33 @@ void publishTask(void* arg) {
         xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
         delayMs += xWasDelayed;
         if(lidar->publishQueue != NULL && xQueueReceive(lidar->publishQueue, &batchToPublish, 0) == pdTRUE) {
-			if(batchToPublish->measurements[0].angle > 10 ||
-				batchToPublish->measurements[batchToPublish->total_measurements-1].angle < 350) {
-					Serial.printf("Bad batch: %d, min angle: %4.1f, max angle %4.1f\n",
-					batchToPublish->total_measurements,
-					batchToPublish->measurements[0].angle,
-					batchToPublish->measurements[batchToPublish->total_measurements-1].angle);
-					badBatch++;
-					if(badBatch > 3)
-						lidar->stopScan();
-				}
-			//Serial.printf("total_mes:%d\n",batchToPublish->total_measurements);
+            //Copy batch as we use roundrobbin and don't want it overwritten.
+            copyLaserScanBatch(&currentBatch, batchToPublish);
 
+            if(minFreePool > uxQueueSpacesAvailable(lidar->publishQueue))
+                minFreePool = uxQueueSpacesAvailable(lidar->publishQueue);
 
-            //char buffer[256];
-            //sprintf(buffer,"measurements %d, rotations %d", batchToPublish->total_measurements, batchToPublish->total_rotations);
-            //publishMessage(buffer);
             long scan_time_us = (micros() - startMicros);
             startMicros = micros();
-            if(publishScanMessages(batchToPublish, time_ns, scan_time_us) != RCL_RET_OK)
-				lidar->stopScan();
-            //reset for next tinme.
-            //time_ns = time_ns + startMicros*1000;
-             time_ns = rmw_uros_epoch_nanos();
+            if(publishScanMessages(&currentBatch, time_ns, scan_time_us) != RCL_RET_OK)
+                    lidar->stopScan();
 
-            totalMeasurements += batchToPublish->total_measurements;
-            totalRotations += batchToPublish->total_rotations;
+            time_ns = rmw_uros_epoch_nanos();
+
+            totalMeasurements += currentBatch.total_measurements;
+            totalRotations += currentBatch.total_rotations;
             totalMessages++;
             
             if(totalMessages >= 120) {
                 Serial.printf("%d, pubs (ms): %.0f, mes/rot: %.1f, "
                             "Measurements: %d, Rate: %.0f meas/s,"
-                            "Free queue space: %d,  Num of Delays: %d\n",
+                            "Min free pool: %d,  Num of Delays: %d\n",
                     totalMessages,
                     1.0*(millis() - startMs)/totalMessages,
                     1.0*totalMeasurements/totalRotations,
                     totalMeasurements,
                     1000.0 * totalMeasurements / (millis() - startMs),
-                    uxQueueSpacesAvailable(lidar->publishQueue),
+                    minFreePool,
                     delayMs);
 
                 totalMeasurements = 0;
@@ -538,9 +517,6 @@ void startLidarScan() {
     }
     Serial.println("Scan started successfully");
     createPublishTask();
-
-    // Wait for measurements to start
-    delay(200);
 }
 
 void setup() {
@@ -553,31 +529,11 @@ void setup() {
 	setupWifi();
 
 	setupMicroROS();
-    /*start test
-    int64_t time_ns = rmw_uros_epoch_nanos();
-    //rcutils_time_point_value_t time_ns;
-    //rcutils_system_time_now(&time_ns);
-
-    printf("Raw time_ns: %" PRId64 "\n", time_ns);
-
-    int64_t time_secs = time_ns / 1000000000LL;
-    printf("time_secs (int64_t): %" PRId64 "\n", time_secs);
-
-    int32_t sec = (int32_t)time_secs;
-    printf("sec (int32_t): %d\n", sec); // Use %d for int32_t
-
-    uint32_t nanosec = (uint32_t)(time_ns % 1000000000LL);
-    printf("nanosec (uint32_t): %u\n", nanosec);  // Use %u for uint32_t
-
-    return;
-    //end test*/
-
 	setupLidar();
   initScanPublisher();
   startLidarScan();
 }
 
 void loop() {
-    //publishMessage("Hello there!");
-    //vTaskDelay(pdMS_TO_TICKS(100));
+
 }

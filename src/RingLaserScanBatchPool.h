@@ -19,7 +19,7 @@ public:
     void releaseBatch(LaserScanBatch* batch) override;
     
     size_t getNumOfBatches() const override;
-    size_t getCurrentIndex() const;
+    size_t getCurrentIndex() const override;
 };
 
 #endif // RING_LASER_SCAN_BATCH_POOL_H
