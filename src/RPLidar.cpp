@@ -1043,9 +1043,9 @@ bool RPLidar::verifyResponseDescriptor(uint8_t expectedMode, uint8_t expectedTyp
 }
 
 void RPLidar::flushInput() {
-    //while (_serial.available()) {
-    //    _serial.read();
-    //}
+    while (available()) {
+        readByte();
+    }
 }
 
 uint8_t RPLidar::checksum(const uint8_t* data, uint8_t len) {

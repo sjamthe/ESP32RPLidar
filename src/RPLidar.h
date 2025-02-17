@@ -19,7 +19,7 @@ struct MeasurementData {
 };
 
 #define UART_BAUD_RATE 115200
-#define RX_TIMEOUT_MS 1
+#define RX_TIMEOUT_MS 2
 #define RING_BUFFER_SIZE (1*1024)
 #define UART_RX_BUF_SIZE 256
 

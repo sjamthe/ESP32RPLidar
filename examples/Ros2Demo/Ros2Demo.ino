@@ -107,19 +107,7 @@ void syncClock() {
 		tv.tv_usec = (long) usec;
         Serial.printf("Setting time %lld(secs), %ld (usec)\n", tv.tv_sec, tv.tv_usec);
         Serial.printf("Clock synchronized with Micro-ROS agent\n");
-        //Don't sync ESP clock
-		//settimeofday(&tv, NULL);
 	}
-	/*struct tm timeinfo;
-    char timeStringBuff[50];  // Make sure this is large enough for your format
-    // Get and print local time
-    if (getLocalTime(&timeinfo)) {
-        strftime(timeStringBuff, sizeof(timeStringBuff), "%A, %B %d %Y %H:%M:%S %Z\n", &timeinfo);
-        Serial.printf("Current time: %s", timeStringBuff);  
-    } else {
-        Serial.printf("Failed to obtain time\n");
-    }
-	Serial.printf("Clock synchronized with Micro-ROS agent\n");*/
 }
 
 void setupMicroROS() {
@@ -165,7 +153,7 @@ void setupMicroROS() {
 		"Agent not responding. Make sure  micro_ros_agent is running on IP %s, port %d\n",ROS_AGENT_IP, ROS_AGENT_PORT);
 		ros_init_status = false;
 		vTaskDelay(pdMS_TO_TICKS(1000));
-		ESP.restart();;
+		ESP.restart();
 	}
 		ros_init_status = true;
 	Serial.printf("MicroROS support started connecting to agent on IP %s, port %d\n",ROS_AGENT_IP, ROS_AGENT_PORT);
@@ -178,7 +166,7 @@ void setupMicroROS() {
 	if(retval != RCL_RET_OK) {
 		Serial.printf("Error(%d) creating micro-ROS node. %s\n",retval, rcutils_get_error_string());
 		rcl_reset_error();
-		ESP.restart();;
+		ESP.restart();
 	}
 	Serial.printf("MicroROS Node %s started\n", ROS_NODE_NAME);
 
@@ -242,7 +230,7 @@ void setupLidar() {
     batchPool = new RingLaserScanBatchPool(10);
     if (!batchPool) {
         Serial.println("Failed to create batch pool");
-        ESP.restart();;
+        ESP.restart();
     }
     Serial.println("Batch pool created");
     
@@ -251,7 +239,7 @@ void setupLidar() {
     if (!lidar) {
         Serial.println("Failed to create lidar");
         delete batchPool;
-        ESP.restart();;
+        ESP.restart();
     }
     Serial.println("Lidar created");
     
@@ -260,17 +248,24 @@ void setupLidar() {
         Serial.println("Failed to initialize lidar");
         delete lidar;
         delete batchPool;
-        ESP.restart();;
+        ESP.restart();
     }
     
     Serial.println("Initialization complete");
 
 	int attempts = 0;
-	while (getLidarInfo() != true && attempts < 3) {
-		delay(5000);
+  int maxAttempts = 10;
+  bool retval = false;
+  RPLidar::DeviceHealth health;
+	while (attempts < 10) {
+    if(getLidarInfo()) return;
+    lidar->resetLidar();
+    delay(5000);
+		lidar->getHealth(health);
 		attempts++;
-		Serial.printf("Lidar getInfo attempt %d/3\n", attempts);
+		Serial.printf("Lidar getInfo attempt %d/%d\n", attempts, maxAttempts);
 	}
+  ESP.restart();
 }
 
 void publishMessage(char* buffer) {
@@ -291,8 +286,8 @@ void publishMessage(char* buffer) {
 		return;
 	}
 }
-
-int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long scan_time_us) {
+ // Publish sequential chunks
+int publishScanMessageChunks(LaserScanBatch* batchToPublish, int64_t time_ns, long scan_time_us) {
     const int maxCount = 55; // Limit because of MTU memory limitation in transport layer. (UXR_CONFIG_UDP_TRANSPORT_MTU = 512b)
     char frameId[50];
     float intensities[maxCount]; // static allocation
@@ -345,11 +340,6 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
         scanMsg.angle_min = batchToPublish->measurements[start*maxCount].angle*M_PI/180.0;
         scanMsg.angle_max = batchToPublish->measurements[start*maxCount + count -1].angle*M_PI/180.0;
         scanMsg.angle_increment = (scanMsg.angle_max - scanMsg.angle_min) / (double)(count);
-        /*Serial.printf("start %d, last %d, angle_min: %f, angle_max: %f, count: %d\n", 
-                start*maxCount,
-                (start*maxCount + count -1),
-                scanMsg.angle_min, scanMsg.angle_max, count);
-        */
         scanMsg.scan_time = scan_time_us/1000000.0;
         scanMsg.time_increment = scanMsg.scan_time / (double)(count);
         scanMsg.range_min = 0.05; // in meters
@@ -386,6 +376,90 @@ int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long sc
             Serial.printf("Error(%d) publishing scan for range.size %d\n",retval, scanMsg.ranges.size);
             Serial.printf("angle_min: %f, angle_max: %f, count: %d\n", 
                 scanMsg.angle_min, scanMsg.angle_max, count);
+            rcl_reset_error();
+            return retval;  
+        }
+    }
+    return RCL_RET_OK;
+}
+
+//Publish stripped chunks so that all chunks cover a rotation.
+int publishScanMessages(LaserScanBatch* batchToPublish, int64_t time_ns, long scan_time_us) {
+    const int maxCount = 55; // Limit because of MTU memory limitation in transport layer. (UXR_CONFIG_UDP_TRANSPORT_MTU = 512b)
+    char frameId[50];
+    float intensities[maxCount]; // static allocation
+    float ranges[maxCount];
+
+    strcpy(frameId, FRAME_ID);
+
+    if (batchToPublish->total_measurements <= maxCount) {
+        Serial.println("skipping, count too low.");
+        return RCL_RET_OK;
+    }
+
+    int numOfChunks = int(batchToPublish->total_measurements / maxCount);
+    if(batchToPublish->total_measurements > numOfChunks * maxCount) numOfChunks++;
+    
+    //int64_t chunck_time_ns = time_ns;
+    int64_t time_secs = time_ns / 1000000000LL;
+    int32_t sec = (int32_t)time_secs;
+
+    for (int start=0; start<numOfChunks; start++) {
+        int count = int(batchToPublish->total_measurements / numOfChunks);
+        // Find last Index
+        if((batchToPublish->total_measurements - start) / numOfChunks > count) count++;
+        int lastIndex = (count-1)*numOfChunks + start;
+
+        sensor_msgs__msg__LaserScan scanMsg;
+
+        scanMsg.header.frame_id.data = frameId;
+        scanMsg.header.frame_id.size = strlen(scanMsg.header.frame_id.data);
+        scanMsg.header.frame_id.capacity = strlen(scanMsg.header.frame_id.data);
+
+        scanMsg.header.stamp.sec = sec;
+        scanMsg.header.stamp.nanosec = (uint32_t)(time_ns % 1000000000LL);
+
+        scanMsg.angle_min = batchToPublish->measurements[start].angle*M_PI/180.0;
+        scanMsg.angle_max = batchToPublish->measurements[lastIndex].angle*M_PI/180.0;
+        scanMsg.angle_increment = (scanMsg.angle_max - scanMsg.angle_min) / (double)(count);
+
+        scanMsg.scan_time = scan_time_us/1000000.0;
+        scanMsg.time_increment = scanMsg.scan_time / (double)(count);
+        scanMsg.range_min = 0.05; // in meters
+        scanMsg.range_max = 12.0; // in meters
+
+        scanMsg.intensities.size = count;
+        scanMsg.intensities.capacity = count;
+        scanMsg.ranges.size = count;
+        scanMsg.ranges.capacity = count;
+
+        scanMsg.intensities.data = intensities;
+        scanMsg.ranges.data = ranges;
+        if (scanMsg.intensities.data == NULL || scanMsg.ranges.data == NULL) {
+            Serial.printf("Failed to allocate data arrays for count %d\n", count);
+            return RCL_RET_ERROR;
+        }
+        
+        for (size_t i = 0; i < count; i++) {
+            int index = i*numOfChunks + start;
+            if(i >= batchToPublish->total_measurements) {
+                Serial.printf("Too high i:%d, batchToPublish->total_measurements:%d\n",i, batchToPublish->total_measurements);
+                break;
+            }
+            float readValue = batchToPublish->measurements[index].distance/1000.0;
+            if(readValue == 0.0) {
+                scanMsg.ranges.data[i] = std::numeric_limits<float>::infinity();
+            } else {
+                scanMsg.ranges.data[i] = readValue;
+            }
+            scanMsg.intensities.data[i] = batchToPublish->measurements[index].quality;
+        }
+        rcl_ret_t retval = rcl_publish(&scan_publisher, &scanMsg, NULL);
+        //With the new best effort policy we din't get errors even if ros-agent is down.
+        if(retval != RCL_RET_OK) {
+            Serial.printf("Error(%d) publishing scan for range.size %d\n",retval, scanMsg.ranges.size);
+            Serial.printf("angle_min: %f, angle_max: %f, start: %d, count: %d\n", 
+                scanMsg.angle_min, scanMsg.angle_max, start, count);
             rcl_reset_error();
             return retval;  
         }
